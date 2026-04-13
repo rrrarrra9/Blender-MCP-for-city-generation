@@ -282,6 +282,299 @@ All telemetry data is fully anonymized and used solely to improve BlenderMCP.
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+---
+
+## City Generation Tools
+
+These tools enable Claude to build and iterate on large-scale 3D environments
+(cities, terrain, point clouds) through a structured JSON feedback loop — no
+screenshots required.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the coordinate system and design.
+
+### Prerequisites
+
+Install the additional dependencies:
+
+```bash
+uv sync   # picks up requests, laspy, open3d from pyproject.toml
+```
+
+`laspy` and `open3d` are only needed inside Blender's Python for
+`import_pointcloud`; everything else uses the standard library or `requests`
+(already present in the addon).
+
+---
+
+### `set_geo_origin(lat, lon)`
+
+Sets the geographic reference point for the scene. Must be called before any
+tool that converts lat/lon coordinates.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `lat` | `float` | Latitude in decimal degrees |
+| `lon` | `float` | Longitude in decimal degrees |
+
+**Output**
+
+```json
+{ "lat": 48.8584, "lon": 2.2945, "stored": true }
+```
+
+Stored as scene custom properties (`geo_origin_lat`, `geo_origin_lon`) so the
+value survives file saves.
+
+---
+
+### `import_osm_tile(bbox, layer_types)`
+
+Fetches OpenStreetMap data from the Overpass API and creates Blender geometry.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `bbox` | `dict` | `{ "min_lat", "max_lat", "min_lon", "max_lon" }` |
+| `layer_types` | `list[str]` | Any subset of `["buildings","roads","water","parks","railways"]` |
+
+**Output**
+
+```json
+{
+  "objects_created": 312,
+  "layers": { "buildings": 180, "roads": 120, "parks": 12 }
+}
+```
+
+Buildings are extruded using the OSM `height` tag (metres), `building:levels`
+× 3 m, or 10 m as a default.  All objects receive `osm_*` custom properties
+for later use by `apply_procedural_materials`.
+
+---
+
+### `get_scene_graph()`
+
+Returns a compact JSON representation of the entire active scene.
+
+**Output**
+
+```json
+{
+  "scene": "Scene",
+  "frame_current": 1,
+  "object_count": 412,
+  "objects": [
+    {
+      "name": "osm_123456",
+      "type": "MESH",
+      "location": [12.3, 45.6, 0.0],
+      "rotation_euler": [0, 0, 0],
+      "scale": [1, 1, 1],
+      "visible": true,
+      "parent": null,
+      "children": [],
+      "materials": ["mat_building_concrete"],
+      "modifiers": [],
+      "mesh": { "vertices": 16, "edges": 24, "faces": 10 },
+      "bbox": [[-5,-5,0], [5,5,12]]
+    }
+  ],
+  "collections": [
+    { "name": "buildings", "children": [], "objects": ["osm_123456"] }
+  ]
+}
+```
+
+---
+
+### `validate_geometry(object_name?)`
+
+Runs mesh analysis and returns structured error/warning reports.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `object_name` | `str \| None` | Object to validate, or `null` for the whole scene |
+
+**Output (single object)**
+
+```json
+{
+  "object": "osm_123456",
+  "errors": [
+    { "type": "non_manifold_edges", "count": 4, "indices": [1,2,3,4] },
+    { "type": "zero_area_faces", "count": 1, "indices": [7] }
+  ],
+  "warnings": [
+    { "type": "no_uv_map" }
+  ],
+  "clean": false
+}
+```
+
+**Output (full scene)**
+
+```json
+{
+  "scene_clean": false,
+  "objects": [ ...per-object reports... ]
+}
+```
+
+Checks: non-manifold edges, inverted normals, duplicate faces, isolated
+vertices, zero-area faces, missing UV map, low UV coverage (< 5 %), object
+origin outside ± 10 000 m.
+
+---
+
+### `take_snapshot(snapshot_id)`
+
+Stores the current scene state in memory.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `snapshot_id` | `str` | Arbitrary key, e.g. `"before_materials"` |
+
+**Output**
+
+```json
+{ "snapshot_id": "before_materials", "object_count": 312, "timestamp": "2024-01-01T00:00:00Z" }
+```
+
+---
+
+### `get_scene_diff(snapshot_id)`
+
+Compares the current scene to a stored snapshot and returns only what changed.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `snapshot_id` | `str` | Key from a prior `take_snapshot()` call |
+
+**Output**
+
+```json
+{
+  "snapshot_id": "before_materials",
+  "snapshot_timestamp": "2024-01-01T00:00:00Z",
+  "added": ["NewObject"],
+  "deleted": ["OldObject"],
+  "modified": [
+    {
+      "name": "osm_123456",
+      "field": "face_count",
+      "before": 6,
+      "after": 10,
+      "bbox_before": [[-1,-1,0],[1,1,3]],
+      "bbox_after":  [[-1,-1,0],[1,1,6]]
+    }
+  ]
+}
+```
+
+---
+
+### `export_usd_tile(output_path, center, radius_m)`
+
+Exports a spatial subset of the scene as a USD file.
+
+**Input**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `output_path` | `str` | Absolute path for the `.usdc` / `.usda` file |
+| `center` | `[float, float]` | World-space `[x, y]` of the tile centre |
+| `radius_m` | `float` | Tile radius in metres |
+
+**Output**
+
+```json
+{ "path": "/tmp/city_tile.usdc", "file_size_mb": 14.2, "object_count": 87 }
+```
+
+---
+
+### `import_pointcloud(file_path, voxel_size?)`
+
+Imports a LiDAR `.las` / `.laz` file, voxel-downsamples it, and creates a
+Blender vertex mesh.
+
+**Input**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `file_path` | `str` | — | Absolute path to `.las` / `.laz` |
+| `voxel_size` | `float` | `0.5` | Voxel grid cell size in metres |
+
+**Output**
+
+```json
+{
+  "points_loaded": 4200000,
+  "points_after_voxel": 182000,
+  "mesh_created": true
+}
+```
+
+Requires `laspy` in Blender's Python.  `open3d` is used for voxel downsampling
+when available; otherwise falls back to NumPy.
+
+---
+
+### `apply_procedural_materials(ruleset?)`
+
+Assigns Principled BSDF node-tree materials based on `osm_layer` custom
+properties.  No image textures — fully procedural.
+
+**Input**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ruleset` | `str` | `"default"` | Material ruleset name |
+
+**Default ruleset mappings**
+
+| OSM layer | Material | Key nodes |
+|-----------|----------|-----------|
+| `buildings` | concrete / brick / glass | Principled BSDF + Noise |
+| `roads` / `railways` | asphalt | Principled BSDF + Wave (lane markings) |
+| `water` | transparent blue | Principled BSDF (Transmission) |
+| `parks` | grass | Principled BSDF + Musgrave roughness |
+
+**Output**
+
+```json
+{ "ruleset": "default", "materials_applied": 312 }
+```
+
+---
+
+### Running the end-to-end test
+
+```bash
+blender --background --python tests/test_city_pipeline.py
+```
+
+The test script:
+1. Sets geo origin to the Eiffel Tower (48.8584, 2.2945)
+2. Imports an OSM tile (~400 m radius, buildings + roads + parks)
+3. Validates all geometry
+4. Takes a snapshot
+5. Applies procedural materials
+6. Diffs the scene against the snapshot
+7. Exports a USD tile
+8. Prints a full JSON report of every step
+
+---
+
 ## Disclaimer
 
 This is a third-party integration and not made by Blender. Made by [Siddharth](https://x.com/sidahuj)

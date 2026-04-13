@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude mcp:*)",
+      "Bash(where uvx:*)",
+      "Bash(uv --version)",
+      "Read(//c/Users/Swich/.local/bin//**)",
+      "Read(//c/Users/Swich/AppData/Local/uv/**)",
+      "mcp__blender__execute_blender_code",
+      "Bash(python -c ':*)",
+      "mcp__blender__get_scene_info",
+      "mcp__blender__get_viewport_screenshot"
+    ]
+  }
+}

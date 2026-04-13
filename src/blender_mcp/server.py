@@ -1176,6 +1176,9 @@ def asset_creation_strategy() -> str:
     - The task specifically requires a basic material/color
     """
 
+# Register city generation tools (imports against the mcp instance above)
+from . import city_tools  # noqa: F401, E402  — side-effect import registers tools
+
 # Main execution
 
 def main():

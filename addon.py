@@ -252,6 +252,25 @@ class BlenderMCPServer:
             }
             handlers.update(hunyuan_handlers)
 
+        # City tools — always available
+        city_handler_names = [
+            "get_scene_graph", "validate_geometry", "take_snapshot",
+            "get_scene_diff", "export_usd_tile", "import_osm_tile",
+            "set_geo_origin", "import_pointcloud",
+            "apply_procedural_materials",
+            "add_street_detail", "add_vegetation", "add_ground_detail",
+            "add_facade_textures", "add_ambient_occlusion",
+            "add_road_geometry", "add_lighting_setup",
+            "generate_facade_geometry",
+            "generate_building_detail", "set_render_settings", "render_viewport",
+        ]
+        city_handlers = {
+            name: getattr(self, name)
+            for name in city_handler_names
+            if hasattr(self, name)
+        }
+        handlers.update(city_handlers)
+
         handler = handlers.get(cmd_type)
         if handler:
             try:
@@ -2318,6 +2337,3256 @@ class BlenderMCPServer:
                     os.remove(obj_file_path)
             except Exception as e:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
+    # ── City Tools ──────────────────────────────────────────────────────────────
+
+    def get_scene_graph(self):
+        """Return a compact JSON scene graph for the entire active scene."""
+        import math
+
+        POLYCOUNT_BUDGET = 50_000
+
+        def _round3(v):
+            return [round(float(x), 4) for x in v]
+
+        def _collection_tree(col):
+            return {
+                "name": col.name,
+                "children": [_collection_tree(c) for c in col.children],
+                "objects": [o.name for o in col.objects],
+            }
+
+        scene = bpy.context.scene
+        objects = []
+        total_verts = 0
+        total_faces = 0
+        total_materials_used = set()
+
+        for obj in scene.objects:
+            entry = {
+                "name": obj.name,
+                "type": obj.type,
+                "location": _round3(obj.location),
+                "rotation_euler": _round3(obj.rotation_euler),
+                "scale": _round3(obj.scale),
+                "visible": obj.visible_get(),
+                "parent": obj.parent.name if obj.parent else None,
+                "children": [c.name for c in obj.children],
+                "materials": [s.material.name if s.material else None for s in obj.material_slots],
+                "modifiers": [m.name for m in obj.modifiers],
+            }
+            if obj.type == "MESH" and obj.data:
+                m = obj.data
+                nv = len(m.vertices)
+                nf = len(m.polygons)
+                total_verts += nv
+                total_faces += nf
+                for slot in obj.material_slots:
+                    if slot.material:
+                        total_materials_used.add(slot.material.name)
+
+                entry["mesh"] = {
+                    "vertices": nv,
+                    "edges": len(m.edges),
+                    "faces": nf,
+                }
+                if nf > POLYCOUNT_BUDGET:
+                    entry["mesh"]["budget_warning"] = (
+                        f"faces ({nf}) exceeds budget of {POLYCOUNT_BUDGET}"
+                    )
+
+                # Quick health flags (no bmesh — cheap)
+                health = []
+                if not obj.material_slots or all(s.material is None for s in obj.material_slots):
+                    health.append("no_material")
+                if not m.uv_layers:
+                    health.append("no_uv")
+                # Inverted-normals heuristic: sample up to 200 faces, count inward-pointing
+                centroid = mathutils.Vector((0.0, 0.0, 0.0))
+                if m.vertices:
+                    for v in m.vertices:
+                        centroid += v.co
+                    centroid /= len(m.vertices)
+                sample = m.polygons[:200]
+                inward = sum(
+                    1 for f in sample
+                    if (f.center - centroid).normalized().dot(
+                        mathutils.Vector(f.normal).normalized()) < -0.4
+                )
+                if inward > len(sample) * 0.1:
+                    health.append("likely_inverted_normals")
+
+                if health:
+                    entry["health_flags"] = health
+
+                try:
+                    entry["bbox"] = self._get_aabb(obj)
+                except Exception:
+                    pass
+
+            objects.append(entry)
+
+        # Scene-level memory estimate: ~32 bytes/vertex (pos + normal + uv + color)
+        mem_mb = round(total_verts * 32 / 1_048_576, 2)
+
+        collections = [_collection_tree(c) for c in scene.collection.children]
+        return {
+            "scene": scene.name,
+            "frame_current": scene.frame_current,
+            "object_count": len(objects),
+            "objects": objects,
+            "collections": collections,
+            "totals": {
+                "vertices": total_verts,
+                "faces": total_faces,
+                "unique_materials": len(total_materials_used),
+                "estimated_memory_mb": mem_mb,
+            },
+        }
+
+    def validate_geometry(self, object_name=None):
+        """Run mesh analysis on one object or the whole scene.
+
+        Each issue carries a 'severity' field: CRITICAL / WARNING / INFO.
+        """
+        import bmesh
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _issue(severity, type_, **kw):
+            return {"severity": severity, "type": type_, **kw}
+
+        def _validate_obj(obj):
+            report = {
+                "object": obj.name,
+                "issues": [],   # flat list, each entry has severity + type
+                "clean": True,
+            }
+            if obj.type != "MESH" or not obj.data:
+                report["issues"].append(_issue("INFO", "not_a_mesh"))
+                return report
+
+            mesh = obj.data
+
+            # ── bmesh checks ─────────────────────────────────────────────────
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bm.normal_update()
+
+            # Non-manifold edges
+            non_manifold = [e.index for e in bm.edges if not e.is_manifold]
+            if non_manifold:
+                report["issues"].append(_issue(
+                    "CRITICAL", "non_manifold_edges",
+                    count=len(non_manifold), indices=non_manifold[:50]))
+                report["clean"] = False
+
+            # Isolated vertices
+            isolated = [v.index for v in bm.verts if not v.link_edges]
+            if isolated:
+                report["issues"].append(_issue(
+                    "WARNING", "isolated_vertices",
+                    count=len(isolated), indices=isolated[:50]))
+
+            # Zero-area faces
+            zero_area = [f.index for f in bm.faces if f.calc_area() < 1e-8]
+            if zero_area:
+                report["issues"].append(_issue(
+                    "CRITICAL", "zero_area_faces",
+                    count=len(zero_area), indices=zero_area[:50]))
+                report["clean"] = False
+
+            # Inverted normals heuristic
+            centroid = bm.calc_center_median()
+            inverted = [
+                f.index for f in bm.faces
+                if (f.calc_center_median() - centroid).length > 1e-6
+                and f.normal.dot((f.calc_center_median() - centroid).normalized()) < -0.5
+            ]
+            if inverted:
+                report["issues"].append(_issue(
+                    "WARNING", "inverted_normals",
+                    count=len(inverted), indices=inverted[:50]))
+
+            # Duplicate / overlapping faces
+            face_sets: dict = {}
+            for f in bm.faces:
+                key = frozenset(v.index for v in f.verts)
+                face_sets.setdefault(key, []).append(f.index)
+            duplicates = [idxs for idxs in face_sets.values() if len(idxs) > 1]
+            if duplicates:
+                flat = [i for grp in duplicates for i in grp]
+                report["issues"].append(_issue(
+                    "CRITICAL", "duplicate_faces",
+                    count=len(duplicates), indices=flat[:50]))
+                report["clean"] = False
+
+            bm.free()
+
+            # ── UV checks ────────────────────────────────────────────────────
+            if not mesh.uv_layers:
+                report["issues"].append(_issue("WARNING", "no_uv_map"))
+            elif mesh.uv_layers.active:
+                us = [d.uv for d in mesh.uv_layers.active.data]
+                if us:
+                    xs = [u[0] for u in us]; ys = [u[1] for u in us]
+                    coverage = (max(xs) - min(xs)) * (max(ys) - min(ys))
+                    if coverage < 0.05:
+                        report["issues"].append(_issue(
+                            "WARNING", "low_uv_coverage",
+                            coverage=round(coverage, 4)))
+
+            # ── Scene-bounds check ───────────────────────────────────────────
+            loc = obj.location
+            if any(abs(v) > 10_000 for v in loc):
+                report["issues"].append(_issue(
+                    "WARNING", "outside_scene_bounds",
+                    location=[round(float(v), 2) for v in loc]))
+
+            # ── NEW: scale not applied ────────────────────────────────────────
+            s = obj.scale
+            if abs(s.x - 1.0) > 1e-3 or abs(s.y - 1.0) > 1e-3 or abs(s.z - 1.0) > 1e-3:
+                report["issues"].append(_issue(
+                    "WARNING", "unapplied_scale",
+                    scale=[round(float(v), 4) for v in s]))
+
+            # ── NEW: origin far from geometry center ──────────────────────────
+            if mesh.vertices:
+                # Geometry centroid in object-local space
+                lc = mathutils.Vector((0.0, 0.0, 0.0))
+                for v in mesh.vertices:
+                    lc += v.co
+                lc /= len(mesh.vertices)
+                dist = lc.length  # distance from object origin (local 0,0,0)
+                if dist > 10.0:
+                    report["issues"].append(_issue(
+                        "INFO", "origin_far_from_geometry",
+                        offset_m=round(dist, 2)))
+
+            return report
+
+        # ── NEW: overlapping objects (scene-level, only when doing whole scene) ──
+        def _check_overlapping(objs):
+            issues = []
+            centroids = {}
+            for obj in objs:
+                if obj.type != "MESH":
+                    continue
+                c = (round(obj.location.x, 1),
+                     round(obj.location.y, 1),
+                     round(obj.location.z, 1))
+                centroids.setdefault(c, []).append(obj.name)
+            for c, names in centroids.items():
+                if len(names) > 1:
+                    issues.append({
+                        "type": "overlapping_objects",
+                        "severity": "WARNING",
+                        "centroid": list(c),
+                        "objects": names,
+                    })
+            return issues
+
+        # ── dispatch ─────────────────────────────────────────────────────────
+        if object_name:
+            obj = bpy.data.objects.get(object_name)
+            if not obj:
+                return {"error": f"Object not found: {object_name}"}
+            return _validate_obj(obj)
+
+        scene_objs = list(bpy.context.scene.objects)
+        results = [_validate_obj(o) for o in scene_objs if o.type == "MESH"]
+        overlap_issues = _check_overlapping(scene_objs)
+        all_clean = all(r["clean"] for r in results) and not overlap_issues
+        return {
+            "scene_clean": all_clean,
+            "objects": results,
+            "scene_issues": overlap_issues,
+        }
+
+    # In-memory snapshot store (keyed by snapshot_id string)
+    _snapshots = {}
+
+    def take_snapshot(self, snapshot_id):
+        """Store current scene state keyed by snapshot_id."""
+        from datetime import datetime as _dt
+        import math
+
+        def _obj_state(obj):
+            state = {
+                "type": obj.type,
+                "location": [round(float(v), 4) for v in obj.location],
+                "rotation_euler": [round(float(v), 4) for v in obj.rotation_euler],
+                "scale": [round(float(v), 4) for v in obj.scale],
+                "materials": [s.material.name if s.material else None for s in obj.material_slots],
+            }
+            if obj.type == "MESH" and obj.data:
+                m = obj.data
+                state["mesh"] = {
+                    "vertices": len(m.vertices),
+                    "faces": len(m.polygons),
+                }
+                try:
+                    state["bbox"] = self._get_aabb(obj)
+                except Exception:
+                    pass
+            return state
+
+        snap = {
+            "timestamp": _dt.utcnow().isoformat() + "Z",
+            "objects": {obj.name: _obj_state(obj) for obj in bpy.context.scene.objects},
+        }
+        BlenderMCPServer._snapshots[snapshot_id] = snap
+        return {
+            "snapshot_id": snapshot_id,
+            "object_count": len(snap["objects"]),
+            "timestamp": snap["timestamp"],
+        }
+
+    def get_scene_diff(self, snapshot_id):
+        """Compare current scene to a stored snapshot."""
+        snap = BlenderMCPServer._snapshots.get(snapshot_id)
+        if snap is None:
+            return {"error": f"Snapshot '{snapshot_id}' not found"}
+
+        old_objs = snap["objects"]
+        cur_objs = {obj.name: obj for obj in bpy.context.scene.objects}
+
+        added = [n for n in cur_objs if n not in old_objs]
+        deleted = [n for n in old_objs if n not in cur_objs]
+        modified = []
+
+        for name, obj in cur_objs.items():
+            if name not in old_objs:
+                continue
+            prev = old_objs[name]
+            cur_loc = [round(float(v), 4) for v in obj.location]
+            if cur_loc != prev.get("location"):
+                modified.append({"name": name, "field": "location",
+                                  "before": prev.get("location"), "after": cur_loc})
+                continue
+            if obj.type == "MESH" and obj.data:
+                cur_faces = len(obj.data.polygons)
+                prev_faces = prev.get("mesh", {}).get("faces")
+                if prev_faces is not None and cur_faces != prev_faces:
+                    modified.append({
+                        "name": name,
+                        "field": "face_count",
+                        "before": prev_faces,
+                        "after": cur_faces,
+                    })
+                    try:
+                        modified[-1]["bbox_after"] = self._get_aabb(obj)
+                        modified[-1]["bbox_before"] = prev.get("bbox")
+                    except Exception:
+                        pass
+
+        return {
+            "snapshot_id": snapshot_id,
+            "snapshot_timestamp": snap["timestamp"],
+            "added": added,
+            "deleted": deleted,
+            "modified": modified,
+        }
+
+    def export_usd_tile(self, output_path, center, radius_m):
+        """Export a spatial USD tile for objects within radius_m of center [x, y]."""
+        import mathutils as mu
+        cx, cy = float(center[0]), float(center[1])
+        r = float(radius_m)
+
+        # Collect objects within radius
+        scene = bpy.context.scene
+        selected_names = []
+        for obj in scene.objects:
+            ox, oy = obj.location.x, obj.location.y
+            if ((ox - cx) ** 2 + (oy - cy) ** 2) <= r * r:
+                selected_names.append(obj.name)
+
+        if not selected_names:
+            return {"error": "No objects within radius", "object_count": 0}
+
+        # Deselect all, select target objects
+        bpy.ops.object.select_all(action='DESELECT')
+        for name in selected_names:
+            obj = bpy.data.objects.get(name)
+            if obj:
+                obj.select_set(True)
+
+        # Export USD
+        try:
+            bpy.ops.wm.usd_export(
+                filepath=output_path,
+                selected_objects_only=True,
+                export_materials=True,
+                export_uvmaps=True,
+                export_normals=True,
+            )
+        except Exception as e:
+            return {"error": f"USD export failed: {str(e)}"}
+
+        file_size_mb = 0.0
+        import os as _os
+        if _os.path.exists(output_path):
+            file_size_mb = round(_os.path.getsize(output_path) / (1024 * 1024), 3)
+
+        return {
+            "path": output_path,
+            "file_size_mb": file_size_mb,
+            "object_count": len(selected_names),
+        }
+
+    def set_geo_origin(self, lat, lon):
+        """Store the geo-origin in scene custom properties."""
+        scene = bpy.context.scene
+        scene["geo_origin_lat"] = float(lat)
+        scene["geo_origin_lon"] = float(lon)
+        return {"lat": float(lat), "lon": float(lon), "stored": True}
+
+    @staticmethod
+    def _latlon_to_xy(lat, lon, origin_lat, origin_lon):
+        """Equirectangular projection: 1 Blender unit = 1 metre."""
+        import math
+        R = 6_371_000.0  # Earth radius in metres
+        x = math.radians(lon - origin_lon) * R * math.cos(math.radians(origin_lat))
+        y = math.radians(lat - origin_lat) * R
+        return x, y
+
+    def import_osm_tile(self, bbox, layer_types):
+        """Fetch OSM data from Overpass and build Blender geometry."""
+        import math
+
+        scene = bpy.context.scene
+        origin_lat = scene.get("geo_origin_lat")
+        origin_lon = scene.get("geo_origin_lon")
+        if origin_lat is None or origin_lon is None:
+            return {"error": "Geo origin not set — call set_geo_origin() first"}
+
+        min_lat = float(bbox["min_lat"])
+        max_lat = float(bbox["max_lat"])
+        min_lon = float(bbox["min_lon"])
+        max_lon = float(bbox["max_lon"])
+
+        # Build Overpass query
+        wanted = set(layer_types)
+        filters = []
+        if "buildings" in wanted:
+            filters.append('way["building"]')
+        if "roads" in wanted:
+            filters.append('way["highway"]')
+        if "water" in wanted:
+            filters.append('way["natural"="water"]')
+            filters.append('relation["natural"="water"]')
+        if "parks" in wanted:
+            filters.append('way["leisure"="park"]')
+            filters.append('way["landuse"="grass"]')
+        if "railways" in wanted:
+            filters.append('way["railway"]')
+
+        bbox_str = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+        union_parts = "\n".join(f"  {f}({bbox_str});" for f in filters)
+        query = f"""
+[out:json][timeout:60];
+(
+{union_parts}
+);
+out body;
+>;
+out skel qt;
+"""
+        try:
+            resp = requests.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": query},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return {"error": f"Overpass API request failed: {str(e)}"}
+
+        # Index nodes by id
+        nodes = {}
+        for el in data.get("elements", []):
+            if el["type"] == "node":
+                nx, ny = self._latlon_to_xy(el["lat"], el["lon"], origin_lat, origin_lon)
+                nodes[el["id"]] = (nx, ny)
+
+        # Ensure collections exist
+        def _ensure_collection(name):
+            if name not in bpy.data.collections:
+                col = bpy.data.collections.new(name)
+                bpy.context.scene.collection.children.link(col)
+            return bpy.data.collections[name]
+
+        counts = {lt: 0 for lt in layer_types}
+        total = 0
+
+        for el in data.get("elements", []):
+            if el["type"] != "way":
+                continue
+            tags = el.get("tags", {})
+            nd_refs = el.get("nodes", [])
+            coords = [nodes[n] for n in nd_refs if n in nodes]
+            if len(coords) < 2:
+                continue
+
+            el_id = el["id"]
+
+            # Determine layer
+            if "building" in tags and "buildings" in wanted:
+                layer = "buildings"
+            elif "highway" in tags and "roads" in wanted:
+                layer = "roads"
+            elif "natural" in tags and tags["natural"] == "water" and "water" in wanted:
+                layer = "water"
+            elif ("leisure" in tags or "landuse" in tags) and "parks" in wanted:
+                layer = "parks"
+            elif "railway" in tags and "railways" in wanted:
+                layer = "railways"
+            else:
+                continue
+
+            col = _ensure_collection(layer)
+
+            # --- Create mesh ---
+            verts = [(x, y, 0.0) for x, y in coords]
+            mesh = bpy.data.meshes.new(f"osm_{el_id}")
+            obj = bpy.data.objects.new(f"osm_{el_id}", mesh)
+
+            # Store OSM tags as custom properties
+            obj["osm_id"] = el_id
+            obj["osm_layer"] = layer
+            for k, v in tags.items():
+                obj[f"osm_{k}"] = v
+
+            col.objects.link(obj)
+
+            if layer == "buildings":
+                # Extrude footprint
+                height_m = 10.0
+                if "height" in tags:
+                    try:
+                        height_m = float(str(tags["height"]).replace("m", "").strip())
+                    except ValueError:
+                        pass
+                elif "building:levels" in tags:
+                    try:
+                        height_m = float(tags["building:levels"]) * 3.0
+                    except ValueError:
+                        pass
+
+                n = len(verts)
+                top_verts = [(x, y, height_m) for x, y in coords]
+                all_verts = verts + top_verts
+                bottom_face = list(range(n))
+                top_face = list(range(n, 2 * n))[::-1]
+                side_faces = []
+                for i in range(n - 1):
+                    side_faces.append([i, i + 1, n + i + 1, n + i])
+                faces = [bottom_face, top_face] + side_faces
+                mesh.from_pydata(all_verts, [], faces)
+
+                # Clean up: remove zero-area faces, recalc normals, add UV
+                import bmesh as _bm
+                bme = _bm.new()
+                bme.from_mesh(mesh)
+                # Remove zero-area faces
+                zero_faces = [f for f in bme.faces if f.calc_area() < 1e-6]
+                _bm.ops.delete(bme, geom=zero_faces, context='FACES')
+                # Recalculate normals
+                _bm.ops.recalc_face_normals(bme, faces=bme.faces[:])
+                # Smart UV project
+                bme.to_mesh(mesh)
+                bme.free()
+                mesh.update()
+                # UV unwrap via operator (object already linked to collection above)
+                bpy.context.view_layer.objects.active = obj
+                obj.select_set(True)
+                try:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception:
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+                obj.select_set(False)
+            else:
+                # Polyline as edges
+                edges = [(i, i + 1) for i in range(len(verts) - 1)]
+                mesh.from_pydata(verts, edges, [])
+                mesh.update()
+
+            counts[layer] = counts.get(layer, 0) + 1
+            total += 1
+
+        return {"objects_created": total, "layers": counts}
+
+    def import_pointcloud(self, file_path, voxel_size=0.5):
+        """Import a .las/.laz point cloud, voxel-downsample, and create a mesh."""
+        import os as _os
+
+        if not _os.path.exists(file_path):
+            return {"error": f"File not found: {file_path}"}
+
+        ext = _os.path.splitext(file_path)[1].lower()
+        if ext not in (".las", ".laz"):
+            return {"error": f"Unsupported format: {ext}. Use .las or .laz"}
+
+        # --- Load points ---
+        try:
+            import laspy
+            las = laspy.read(file_path)
+            pts = las.xyz  # numpy array (N, 3)
+        except ImportError:
+            return {"error": "laspy is not installed. Install it with: pip install laspy"}
+        except Exception as e:
+            return {"error": f"Failed to read point cloud: {str(e)}"}
+
+        points_loaded = len(pts)
+
+        # --- Voxel downsample ---
+        try:
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts)
+            pcd = pcd.voxel_down_sample(voxel_size=float(voxel_size))
+            pts = pcd.points  # open3d Vector3dVector
+            pts_list = [list(p) for p in pts]
+        except ImportError:
+            # Fallback: simple numpy grid voxelisation
+            import numpy as np
+            arr = pts
+            vox = (arr / float(voxel_size)).astype(int)
+            _, unique_idx = np.unique(vox, axis=0, return_index=True)
+            arr = arr[unique_idx]
+            pts_list = arr.tolist()
+        except Exception as e:
+            return {"error": f"Voxel downsampling failed: {str(e)}"}
+
+        points_after = len(pts_list)
+
+        # --- Create Blender mesh ---
+        try:
+            mesh = bpy.data.meshes.new("PointCloud")
+            obj = bpy.data.objects.new("PointCloud", mesh)
+            bpy.context.scene.collection.objects.link(obj)
+            mesh.from_pydata(pts_list, [], [])
+            mesh.update()
+            mesh_created = True
+        except Exception as e:
+            return {"error": f"Failed to create mesh: {str(e)}",
+                    "points_loaded": points_loaded,
+                    "points_after_voxel": points_after,
+                    "mesh_created": False}
+
+        return {
+            "points_loaded": points_loaded,
+            "points_after_voxel": points_after,
+            "mesh_created": mesh_created,
+        }
+
+    def apply_procedural_materials(self, ruleset="default"):
+        """Assign node-tree materials based on collection name / OSM tags."""
+        import random
+
+        def _new_mat(name, unique=False):
+            """Return existing material by name, or create a new one.
+            If unique=True always create a fresh material with that name."""
+            if not unique and name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            return mat
+
+        def _clear_nodes(mat):
+            mat.node_tree.nodes.clear()
+
+        def _principled(mat, base_color, roughness=0.8, metallic=0.0,
+                         transmission=0.0, alpha=1.0):
+            nt = mat.node_tree
+            out = nt.nodes.new("ShaderNodeOutputMaterial")
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+            bsdf.inputs["Base Color"].default_value = (*base_color, 1.0)
+            bsdf.inputs["Roughness"].default_value = roughness
+            bsdf.inputs["Metallic"].default_value = metallic
+            if "Transmission Weight" in bsdf.inputs:
+                bsdf.inputs["Transmission Weight"].default_value = transmission
+            elif "Transmission" in bsdf.inputs:
+                bsdf.inputs["Transmission"].default_value = transmission
+            bsdf.inputs["Alpha"].default_value = alpha
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            out.location = (600, 0)
+            bsdf.location = (300, 0)
+            return bsdf
+
+        def _mat_brick(obj):
+            """Brick material: wave-texture brick color + noise mortar + bump depth.
+            Each building gets a unique color via Object Info Random node."""
+            mat_name = f"mat_brick_{obj.name}"
+            mat = _new_mat(mat_name, unique=True)
+            _clear_nodes(mat)
+            nt = mat.node_tree
+
+            out  = nt.nodes.new("ShaderNodeOutputMaterial");  out.location  = (900, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled");  bsdf.location = (600, 0)
+            bsdf.inputs["Roughness"].default_value = 0.9
+
+            # Object Info for per-building unique seed
+            obj_info = nt.nodes.new("ShaderNodeObjectInfo"); obj_info.location = (-700, 200)
+
+            # Wave texture drives brick color variation
+            wave = nt.nodes.new("ShaderNodeTexWave");  wave.location = (-500, 200)
+            wave.wave_type = 'BANDS'
+            wave.inputs["Scale"].default_value      = 50.0
+            wave.inputs["Distortion"].default_value = 2.0
+            wave.inputs["Detail"].default_value     = 4.0
+
+            # Mix brick colors (light brick ↔ dark brick)
+            mix_brick = nt.nodes.new("ShaderNodeMixRGB"); mix_brick.location = (-200, 200)
+            mix_brick.blend_type = 'MIX'
+            mix_brick.inputs["Color1"].default_value = (0.65, 0.30, 0.20, 1.0)
+            mix_brick.inputs["Color2"].default_value = (0.55, 0.25, 0.15, 1.0)
+
+            # Noise texture for mortar lines / micro variation
+            noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-500, -100)
+            noise.inputs["Scale"].default_value  = 80.0
+            noise.inputs["Detail"].default_value = 8.0
+
+            # Mix in noise-based mortar (lighter grey between bricks)
+            mix_mortar = nt.nodes.new("ShaderNodeMixRGB"); mix_mortar.location = (100, 100)
+            mix_mortar.blend_type = 'MIX'
+            mix_mortar.inputs["Color2"].default_value = (0.72, 0.70, 0.68, 1.0)  # mortar grey
+
+            # Bump node for surface depth
+            bump = nt.nodes.new("ShaderNodeBump"); bump.location = (300, -200)
+            bump.inputs["Strength"].default_value = 0.4
+            bump.inputs["Distance"].default_value = 0.02
+
+            # Add random per-object hue shift using Object Info Random
+            hue_sat = nt.nodes.new("ShaderNodeHueSaturation"); hue_sat.location = (100, -50)
+            hue_sat.inputs["Saturation"].default_value = 1.0
+            hue_sat.inputs["Value"].default_value      = 1.0
+            # Map 0..1 random to 0.95..1.05 hue range
+            map_range = nt.nodes.new("ShaderNodeMapRange"); map_range.location = (-200, -200)
+            map_range.inputs["From Min"].default_value = 0.0
+            map_range.inputs["From Max"].default_value = 1.0
+            map_range.inputs["To Min"].default_value   = 0.95
+            map_range.inputs["To Max"].default_value   = 1.05
+
+            # Wire up
+            nt.links.new(obj_info.outputs["Random"],   wave.inputs["Phase Offset"])
+            nt.links.new(wave.outputs["Color"],        mix_brick.inputs["Fac"])
+            nt.links.new(noise.outputs["Fac"],         mix_mortar.inputs["Fac"])
+            nt.links.new(mix_brick.outputs["Color"],   mix_mortar.inputs["Color1"])
+            nt.links.new(obj_info.outputs["Random"],   map_range.inputs["Value"])
+            nt.links.new(map_range.outputs["Result"],  hue_sat.inputs["Hue"])
+            nt.links.new(mix_mortar.outputs["Color"],  hue_sat.inputs["Color"])
+            nt.links.new(hue_sat.outputs["Color"],     bsdf.inputs["Base Color"])
+            nt.links.new(noise.outputs["Fac"],         bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"],       bsdf.inputs["Normal"])
+            nt.links.new(bsdf.outputs["BSDF"],         out.inputs["Surface"])
+            return mat
+
+        def _mat_concrete(obj):
+            """Concrete: Musgrave imperfections + AO-like roughness + per-building color seed."""
+            mat_name = f"mat_concrete_{obj.name}"
+            mat = _new_mat(mat_name, unique=True)
+            _clear_nodes(mat)
+            nt = mat.node_tree
+
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (800, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (500, 0)
+
+            # Object Info for per-building color seed
+            obj_info = nt.nodes.new("ShaderNodeObjectInfo"); obj_info.location = (-700, 200)
+
+            # Noise for surface imperfections (ShaderNodeTexMusgrave removed in Blender 4.x)
+            musgrave = nt.nodes.new("ShaderNodeTexNoise"); musgrave.location = (-500, 200)
+            musgrave.inputs["Scale"].default_value     = 15.0
+            musgrave.inputs["Detail"].default_value    = 8.0
+
+            # Map roughness range: 0.7 to 0.95
+            map_rough = nt.nodes.new("ShaderNodeMapRange"); map_rough.location = (-200, 200)
+            map_rough.inputs["From Min"].default_value = 0.0
+            map_rough.inputs["From Max"].default_value = 1.0
+            map_rough.inputs["To Min"].default_value   = 0.70
+            map_rough.inputs["To Max"].default_value   = 0.95
+
+            # Subtle color variation per building
+            obj_map = nt.nodes.new("ShaderNodeMapRange"); obj_map.location = (-500, -100)
+            obj_map.inputs["From Min"].default_value = 0.0
+            obj_map.inputs["From Max"].default_value = 1.0
+            obj_map.inputs["To Min"].default_value   = 0.58
+            obj_map.inputs["To Max"].default_value   = 0.72
+
+            mix_color = nt.nodes.new("ShaderNodeMixRGB"); mix_color.location = (-200, -100)
+            mix_color.blend_type = 'MIX'
+            mix_color.inputs["Fac"].default_value    = 0.5
+            mix_color.inputs["Color1"].default_value = (0.62, 0.60, 0.57, 1.0)
+            mix_color.inputs["Color2"].default_value = (0.70, 0.68, 0.65, 1.0)
+
+            # Wire up
+            nt.links.new(musgrave.outputs["Fac"],      map_rough.inputs["Value"])
+            nt.links.new(map_rough.outputs["Result"],  bsdf.inputs["Roughness"])
+            nt.links.new(obj_info.outputs["Random"],   obj_map.inputs["Value"])
+            nt.links.new(obj_info.outputs["Random"],   mix_color.inputs["Fac"])
+            nt.links.new(mix_color.outputs["Color"],   bsdf.inputs["Base Color"])
+            nt.links.new(bsdf.outputs["BSDF"],         out.inputs["Surface"])
+            return mat
+
+        def _mat_glass(obj):
+            """Glass: thin-film IOR=1.45, reflection tint, fresnel-driven env mix."""
+            mat_name = f"mat_glass_{obj.name}"
+            mat = _new_mat(mat_name, unique=True)
+            _clear_nodes(mat)
+            nt = mat.node_tree
+
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (900, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (600, 0)
+            bsdf.inputs["Roughness"].default_value  = 0.05
+            bsdf.inputs["Metallic"].default_value   = 0.0
+            bsdf.inputs["IOR"].default_value        = 1.45
+            if "Transmission Weight" in bsdf.inputs:
+                bsdf.inputs["Transmission Weight"].default_value = 0.85
+            elif "Transmission" in bsdf.inputs:
+                bsdf.inputs["Transmission"].default_value = 0.85
+
+            # Object Info for per-building random tint
+            obj_info = nt.nodes.new("ShaderNodeObjectInfo"); obj_info.location = (-700, 200)
+
+            # Reflection tint base (slightly blue-green)
+            tint_mix = nt.nodes.new("ShaderNodeMixRGB"); tint_mix.location = (-300, 200)
+            tint_mix.blend_type = 'MIX'
+            tint_mix.inputs["Color1"].default_value = (0.70, 0.85, 1.00, 1.0)
+            tint_mix.inputs["Color2"].default_value = (0.65, 0.90, 0.85, 1.0)
+
+            # Fresnel for edge reflectivity
+            fresnel = nt.nodes.new("ShaderNodeFresnel"); fresnel.location = (-500, -100)
+            fresnel.inputs["IOR"].default_value = 1.45
+
+            # Mix glossy (reflective) with glass (transmissive) via fresnel
+            glossy = nt.nodes.new("ShaderNodeBsdfGlossy"); glossy.location = (200, -200)
+            glossy.inputs["Roughness"].default_value = 0.03
+            glossy.inputs["Color"].default_value     = (0.70, 0.85, 1.0, 1.0)
+
+            mix_shader = nt.nodes.new("ShaderNodeMixShader"); mix_shader.location = (500, -150)
+
+            # Wire up
+            nt.links.new(obj_info.outputs["Random"],  tint_mix.inputs["Fac"])
+            nt.links.new(tint_mix.outputs["Color"],   bsdf.inputs["Base Color"])
+            nt.links.new(fresnel.outputs["Fac"],      mix_shader.inputs["Fac"])
+            nt.links.new(bsdf.outputs["BSDF"],        mix_shader.inputs[1])
+            nt.links.new(glossy.outputs["BSDF"],      mix_shader.inputs[2])
+            nt.links.new(mix_shader.outputs["Shader"], out.inputs["Surface"])
+            mat.blend_method = "BLEND"
+            return mat
+
+        def _mat_building(obj):
+            btype = str(obj.get("osm_building", "yes")).lower()
+            if btype in ("glass", "commercial", "office", "retail"):
+                return _mat_glass(obj)
+            elif btype in ("house", "residential", "apartments"):
+                return _mat_brick(obj)
+            else:
+                return _mat_concrete(obj)
+
+        def _mat_road():
+            mat = _new_mat("mat_road_asphalt")
+            if mat.node_tree and len(mat.node_tree.nodes) > 0:
+                return mat  # already built, share it
+            mat.use_nodes = True
+            _clear_nodes(mat)
+            nt = mat.node_tree
+            bsdf = _principled(mat, (0.08, 0.08, 0.08), roughness=0.95)
+            # Wave texture for subtle lane-marking suggestion
+            wave = nt.nodes.new("ShaderNodeTexWave")
+            wave.inputs["Scale"].default_value = 0.5
+            wave.inputs["Distortion"].default_value = 0.1
+            wave.location = (-400, 100)
+            mix = nt.nodes.new("ShaderNodeMixRGB")
+            mix.inputs["Color1"].default_value = (0.08, 0.08, 0.08, 1)
+            mix.inputs["Color2"].default_value = (0.9, 0.9, 0.8, 1)
+            mix.inputs["Fac"].default_value = 0.0
+            mix.location = (-150, 100)
+            nt.links.new(wave.outputs["Color"], mix.inputs["Fac"])
+            nt.links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
+            return mat
+
+        def _mat_water():
+            mat = _new_mat("mat_water")
+            if mat.node_tree and len(mat.node_tree.nodes) > 0:
+                return mat
+            mat.use_nodes = True
+            _clear_nodes(mat)
+            bsdf = _principled(mat, (0.05, 0.25, 0.55), roughness=0.05,
+                                transmission=0.9, alpha=0.6)
+            mat.blend_method = "BLEND"
+            return mat
+
+        def _mat_park():
+            mat = _new_mat("mat_park_grass")
+            if mat.node_tree and len(mat.node_tree.nodes) > 0:
+                return mat
+            mat.use_nodes = True
+            _clear_nodes(mat)
+            nt = mat.node_tree
+            bsdf = _principled(mat, (0.1, 0.4, 0.08), roughness=0.95)
+            musgrave = nt.nodes.new("ShaderNodeTexNoise")
+            musgrave.inputs["Scale"].default_value = 20.0
+            musgrave.location = (-400, -150)
+            nt.links.new(musgrave.outputs["Fac"], bsdf.inputs["Roughness"])
+            return mat
+
+        applied = 0
+
+        for obj in bpy.context.scene.objects:
+            if obj.type != "MESH":
+                continue
+
+            layer = obj.get("osm_layer", "")
+
+            if layer == "buildings":
+                mat = _mat_building(obj)
+            elif layer in ("roads", "railways"):
+                mat = _mat_road()
+            elif layer == "water":
+                mat = _mat_water()
+            elif layer == "parks":
+                mat = _mat_park()
+            else:
+                continue
+
+            if not obj.material_slots:
+                obj.data.materials.append(mat)
+            else:
+                obj.material_slots[0].material = mat
+            applied += 1
+
+        return {"ruleset": ruleset, "materials_applied": applied}
+
+    # ── add_street_detail ────────────────────────────────────────────────────
+
+    def add_street_detail(self):
+        """Add sidewalks, road markings, and curbs to road objects."""
+        import bmesh as _bm
+        import math
+
+        scene = bpy.context.scene
+        objects_created = 0
+
+        # ---- materials --------------------------------------------------------
+        def _get_or_create_mat(name, base_color, roughness=0.85, emission=None):
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nt = mat.node_tree
+            nt.nodes.clear()
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (400, 0)
+            if emission is not None:
+                em = nt.nodes.new("ShaderNodeEmission"); em.location = (200, 0)
+                em.inputs["Color"].default_value   = (*base_color, 1.0)
+                em.inputs["Strength"].default_value = emission
+                nt.links.new(em.outputs["Emission"], out.inputs["Surface"])
+            else:
+                bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (200, 0)
+                bsdf.inputs["Base Color"].default_value = (*base_color, 1.0)
+                bsdf.inputs["Roughness"].default_value  = roughness
+                nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            return mat
+
+        mat_sidewalk = _get_or_create_mat("mat_sidewalk",    (0.65, 0.63, 0.60), roughness=0.80)
+        mat_marking  = _get_or_create_mat("mat_road_marking",(0.95, 0.95, 0.90), emission=0.3)
+        mat_curb     = _get_or_create_mat("mat_curb",        (0.50, 0.48, 0.45), roughness=0.75)
+
+        # Collect road mesh objects
+        road_objs = [o for o in scene.objects
+                     if o.type == 'MESH' and o.get("osm_layer") == "roads"]
+
+        # Ensure street_detail collection
+        _SD_COL = "street_detail"
+        if _SD_COL not in bpy.data.collections:
+            _c = bpy.data.collections.new(_SD_COL)
+            scene.collection.children.link(_c)
+        detail_col = bpy.data.collections[_SD_COL]
+
+        def _link(obj):
+            detail_col.objects.link(obj)
+
+        for road_obj in road_objs:
+            try:
+                mesh = road_obj.data
+                mw   = road_obj.matrix_world
+
+                # Build ordered world-space polyline from edge adjacency
+                adj = {}
+                for e in mesh.edges:
+                    a, b = e.vertices[0], e.vertices[1]
+                    adj.setdefault(a, []).append(b)
+                    adj.setdefault(b, []).append(a)
+                start = next((vi for vi, nb in adj.items() if len(nb) == 1),
+                             next(iter(adj), None))
+                if start is None:
+                    continue
+                chain = [start]; prev = None
+                while True:
+                    cur = chain[-1]
+                    nxt = [n for n in adj.get(cur, []) if n != prev]
+                    if not nxt:
+                        break
+                    nxt = nxt[0]
+                    if nxt == chain[0] and len(chain) > 2:
+                        break
+                    chain.append(nxt); prev = cur
+                if len(chain) < 2:
+                    continue
+
+                pts = [mathutils.Vector((mw @ mesh.vertices[vi].co).to_tuple()[:2] + (0.0,))
+                       for vi in chain]
+                base = road_obj.name
+
+                # Sidewalk
+                sw_bme = _bm.new()
+                for i in range(len(pts) - 1):
+                    v0, v1 = pts[i], pts[i+1]
+                    seg = v1 - v0
+                    if seg.length < 0.5: continue
+                    seg.normalize()
+                    perp = mathutils.Vector((-seg.y, seg.x, 0.0))
+                    h = mathutils.Vector((0, 0, 0.15))
+                    p = [v0+perp*0.3+h, v1+perp*0.3+h, v1+perp*2.3+h, v0+perp*2.3+h]
+                    sw_bme.faces.new([sw_bme.verts.new(x) for x in p])
+                if sw_bme.faces:
+                    _bm.ops.recalc_face_normals(sw_bme, faces=sw_bme.faces[:])
+                    sw_m = bpy.data.meshes.new(f"Sidewalk_{base}")
+                    sw_bme.to_mesh(sw_m); sw_m.update(); sw_m.materials.append(mat_sidewalk)
+                    sw_o = bpy.data.objects.new(f"Sidewalk_{base}", sw_m)
+                    sw_o["street_detail"] = "sidewalk"
+                    _link(sw_o); objects_created += 1
+                sw_bme.free()
+
+                # Road markings
+                mk_bme = _bm.new()
+                for i in range(len(pts) - 1):
+                    v0, v1 = pts[i], pts[i+1]
+                    seg = v1 - v0
+                    if seg.length < 1.0: continue
+                    seg.normalize()
+                    perp = mathutils.Vector((-seg.y, seg.x, 0.0))
+                    z = mathutils.Vector((0, 0, 0.01))
+                    p = [v0-perp*0.15+z, v1-perp*0.15+z, v1+perp*0.15+z, v0+perp*0.15+z]
+                    mk_bme.faces.new([mk_bme.verts.new(x) for x in p])
+                if mk_bme.faces:
+                    _bm.ops.recalc_face_normals(mk_bme, faces=mk_bme.faces[:])
+                    mk_m = bpy.data.meshes.new(f"Markings_{base}")
+                    mk_bme.to_mesh(mk_m); mk_m.update(); mk_m.materials.append(mat_marking)
+                    mk_o = bpy.data.objects.new(f"Markings_{base}", mk_m)
+                    mk_o["street_detail"] = "road_marking"
+                    _link(mk_o); objects_created += 1
+                mk_bme.free()
+
+                # Curb
+                cb_bme = _bm.new()
+                for i in range(len(pts) - 1):
+                    v0, v1 = pts[i], pts[i+1]
+                    seg = v1 - v0
+                    if seg.length < 0.3: continue
+                    seg.normalize()
+                    perp = mathutils.Vector((-seg.y, seg.x, 0.0))
+                    h = mathutils.Vector((0, 0, 0.1))
+                    p = [v0+perp*0.1+h, v1+perp*0.1+h, v1+perp*0.3+h, v0+perp*0.3+h]
+                    cb_bme.faces.new([cb_bme.verts.new(x) for x in p])
+                if cb_bme.faces:
+                    _bm.ops.recalc_face_normals(cb_bme, faces=cb_bme.faces[:])
+                    cb_m = bpy.data.meshes.new(f"Curb_{base}")
+                    cb_bme.to_mesh(cb_m); cb_m.update(); cb_m.materials.append(mat_curb)
+                    cb_o = bpy.data.objects.new(f"Curb_{base}", cb_m)
+                    cb_o["street_detail"] = "curb"
+                    _link(cb_o); objects_created += 1
+                cb_bme.free()
+
+            except Exception:
+                pass
+
+        return {"objects_created": objects_created, "roads_processed": len(road_objs)}
+
+    # ── add_vegetation ────────────────────────────────────────────────────────
+
+    def add_vegetation(self, density=0.5):
+        """Place trees along road edges as simple LOD meshes."""
+        import bmesh as _bm
+        import random
+        import math
+
+        scene = bpy.context.scene
+        rng = random.Random(42)
+        trees_created = 0
+
+        # ---- materials -------------------------------------------------------
+        def _get_or_create_mat_nodes(name, setup_fn):
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            mat.node_tree.nodes.clear()
+            setup_fn(mat)
+            return mat
+
+        def _setup_trunk(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (400, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (200, 0)
+            bsdf.inputs["Base Color"].default_value = (0.18, 0.10, 0.06, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.9
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+        def _setup_canopy(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (700, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (400, 0)
+            bsdf.inputs["Roughness"].default_value     = 0.85
+            if "Subsurface Weight" in bsdf.inputs:
+                bsdf.inputs["Subsurface Weight"].default_value = 0.3
+            elif "Subsurface" in bsdf.inputs:
+                bsdf.inputs["Subsurface"].default_value = 0.3
+            bsdf.inputs["Subsurface Color"].default_value = (0.15, 0.50, 0.08, 1.0)
+
+            noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-300, 0)
+            noise.inputs["Scale"].default_value  = 6.0
+            noise.inputs["Detail"].default_value = 4.0
+
+            mix = nt.nodes.new("ShaderNodeMixRGB"); mix.location = (100, 0)
+            mix.blend_type = 'MIX'
+            mix.inputs["Color1"].default_value = (0.10, 0.40, 0.05, 1.0)
+            mix.inputs["Color2"].default_value = (0.20, 0.55, 0.10, 1.0)
+
+            nt.links.new(noise.outputs["Fac"],   mix.inputs["Fac"])
+            nt.links.new(mix.outputs["Color"],   bsdf.inputs["Base Color"])
+            nt.links.new(bsdf.outputs["BSDF"],   out.inputs["Surface"])
+
+        mat_trunk  = _get_or_create_mat_nodes("mat_tree_trunk",  _setup_trunk)
+        mat_canopy = _get_or_create_mat_nodes("mat_tree_canopy", _setup_canopy)
+
+        # Collect road objects
+        road_objs = [o for o in scene.objects
+                     if o.type == 'MESH' and o.get("osm_layer") == "roads"]
+
+        # Apply density filter
+        selected_roads = [r for r in road_objs if rng.random() < density]
+
+        for road_obj in selected_roads:
+            mesh = road_obj.data
+            bme = _bm.new()
+            bme.from_mesh(mesh)
+            bme.transform(road_obj.matrix_world)
+            bme.edges.ensure_lookup_table()
+            bme.verts.ensure_lookup_table()
+
+            # Sample edge midpoints as candidate tree positions
+            edge_points = []
+            for edge in bme.edges:
+                v0 = edge.verts[0].co.copy()
+                v1 = edge.verts[1].co.copy()
+                seg_len = (v1 - v0).length
+                # Space trees every 8-12 m
+                spacing = rng.uniform(8.0, 12.0)
+                t = 0.0
+                while t < seg_len:
+                    frac = t / seg_len if seg_len > 0 else 0
+                    pos  = v0.lerp(v1, frac)
+                    edge_dir = (v1 - v0)
+                    if edge_dir.length > 0.01:
+                        edge_dir.normalize()
+                    perp = mathutils.Vector((-edge_dir.y, edge_dir.x, 0.0))
+                    # Offset tree ±1 m from road edge
+                    side_offset = 2.5 + rng.uniform(-1.0, 1.0)
+                    pos += perp * side_offset
+                    pos.z = 0.0
+                    edge_points.append(pos)
+                    t += spacing
+            bme.free()
+
+            # Create one tree at each candidate position
+            for pos in edge_points:
+                # Trunk
+                trunk_h   = 4.0
+                trunk_r   = 0.3
+                bme_t = _bm.new()
+                _bm.ops.create_cone(bme_t, cap_ends=True, cap_tris=False,
+                                    segments=8, radius1=trunk_r, radius2=trunk_r * 0.6,
+                                    depth=trunk_h)
+                t_mesh = bpy.data.meshes.new(f"Tree_trunk_{trees_created}")
+                bme_t.to_mesh(t_mesh); bme_t.free(); t_mesh.update()
+                t_obj = bpy.data.objects.new(f"Tree_trunk_{trees_created}", t_mesh)
+                t_obj.location = pos + mathutils.Vector((0, 0, trunk_h / 2))
+                scene.collection.objects.link(t_obj)
+                t_mesh.materials.append(mat_trunk)
+                t_obj["vegetation"] = "trunk"
+
+                # Canopy (icosphere)
+                canopy_scale = rng.uniform(3.0, 6.0)
+                bme_c = _bm.new()
+                _bm.ops.create_icosphere(bme_c, subdivisions=2, radius=canopy_scale * 0.5)
+                c_mesh = bpy.data.meshes.new(f"Tree_canopy_{trees_created}")
+                bme_c.to_mesh(c_mesh); bme_c.free(); c_mesh.update()
+                c_obj = bpy.data.objects.new(f"Tree_canopy_{trees_created}", c_mesh)
+                c_obj.location = pos + mathutils.Vector((0, 0, trunk_h + canopy_scale * 0.4))
+                # Random scale variation
+                s = rng.uniform(0.85, 1.15)
+                c_obj.scale = (s, s, rng.uniform(0.9, 1.1))
+                scene.collection.objects.link(c_obj)
+                c_mesh.materials.append(mat_canopy)
+                c_obj["vegetation"] = "canopy"
+
+                trees_created += 1
+
+        return {
+            "trees_created": trees_created,
+            "roads_sampled": len(selected_roads),
+            "total_roads": len(road_objs),
+        }
+
+    # ── add_ground_detail ─────────────────────────────────────────────────────
+
+    def add_ground_detail(self):
+        """Replace flat ground with layered zone materials and special plaza handling."""
+        import bmesh as _bm
+        import math
+
+        scene = bpy.context.scene
+        objects_created = 0
+
+        # ---- helper to build or retrieve a material -------------------------
+        def _mat(name, base_color, roughness=0.85, normal_strength=0.0):
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nt = mat.node_tree
+            nt.nodes.clear()
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (600, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (300, 0)
+            bsdf.inputs["Base Color"].default_value = (*base_color, 1.0)
+            bsdf.inputs["Roughness"].default_value  = roughness
+            if normal_strength > 0.0:
+                noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-300, -150)
+                noise.inputs["Scale"].default_value = 40.0
+                bump  = nt.nodes.new("ShaderNodeBump");    bump.location  = (0, -150)
+                bump.inputs["Strength"].default_value = normal_strength
+                nt.links.new(noise.outputs["Fac"], bump.inputs["Height"])
+                nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            return mat
+
+        mat_asphalt   = _mat("mat_ground_asphalt",   (0.07, 0.07, 0.07), roughness=0.95, normal_strength=0.15)
+        mat_pavement  = _mat("mat_ground_pavement",  (0.62, 0.60, 0.57), roughness=0.80)
+        mat_grass     = _mat("mat_ground_grass",     (0.10, 0.38, 0.07), roughness=0.95)
+        mat_plaza_std = _mat("mat_ground_plaza_std", (0.72, 0.70, 0.66), roughness=0.55)
+
+        # ---- Special stone-tile material for Plaça Catalunya ----------------
+        def _mat_plaza_catalonia():
+            name = "mat_plaza_catalonia"
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nt = mat.node_tree
+            nt.nodes.clear()
+
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (800, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (500, 0)
+            bsdf.inputs["Roughness"].default_value = 0.45
+
+            # Radial UV mapping via Geometry → Separate XYZ → atan2
+            geo   = nt.nodes.new("ShaderNodeNewGeometry");  geo.location  = (-700, 0)
+            sep   = nt.nodes.new("ShaderNodeSeparateXYZ");  sep.location  = (-500, 0)
+            atan2 = nt.nodes.new("ShaderNodeMath");         atan2.location = (-300, 0)
+            atan2.operation = 'ARCTAN2'
+
+            combine = nt.nodes.new("ShaderNodeCombineXYZ"); combine.location = (-100, 0)
+            combine.inputs["Z"].default_value = 0.0
+
+            wave = nt.nodes.new("ShaderNodeTexWave"); wave.location = (100, 0)
+            wave.wave_type = 'RINGS'
+            wave.inputs["Scale"].default_value      = 2.5
+            wave.inputs["Distortion"].default_value = 0.3
+
+            mix = nt.nodes.new("ShaderNodeMixRGB"); mix.location = (300, 0)
+            mix.inputs["Color1"].default_value = (0.78, 0.76, 0.72, 1.0)
+            mix.inputs["Color2"].default_value = (0.65, 0.63, 0.59, 1.0)
+
+            nt.links.new(geo.outputs["Position"],      sep.inputs["Vector"])
+            nt.links.new(sep.outputs["X"],             atan2.inputs[0])
+            nt.links.new(sep.outputs["Y"],             atan2.inputs[1])
+            nt.links.new(atan2.outputs["Value"],       combine.inputs["X"])
+            nt.links.new(combine.outputs["Vector"],    wave.inputs["Vector"])
+            nt.links.new(wave.outputs["Color"],        mix.inputs["Fac"])
+            nt.links.new(mix.outputs["Color"],         bsdf.inputs["Base Color"])
+            nt.links.new(bsdf.outputs["BSDF"],         out.inputs["Surface"])
+            return mat
+
+        # Process all objects and assign ground zone materials
+        for obj in scene.objects:
+            if obj.type != "MESH":
+                continue
+
+            osm_layer   = obj.get("osm_layer", "")
+            osm_leisure = str(obj.get("osm_leisure", "")).lower()
+            osm_name    = str(obj.get("osm_name", "")).lower()
+            osm_surface = str(obj.get("osm_surface", "")).lower()
+            osm_landuse = str(obj.get("osm_landuse", "")).lower()
+            osm_highway = str(obj.get("osm_highway", "")).lower()
+
+            mat = None
+
+            if osm_layer == "roads" or osm_highway in ("footway", "path", "pedestrian"):
+                if osm_highway in ("footway", "path"):
+                    mat = mat_pavement
+                else:
+                    mat = mat_asphalt
+            elif osm_layer == "parks" or osm_landuse == "grass" or osm_leisure == "park":
+                mat = mat_grass
+            elif osm_leisure in ("plaza", "square") or osm_landuse in ("plaza", "square"):
+                # Check for Plaça Catalunya
+                if "catalunya" in osm_name or "cataluña" in osm_name:
+                    mat = _mat_plaza_catalonia()
+                else:
+                    mat = mat_plaza_std
+            elif osm_layer == "" and obj.name.lower() in ("groundplane", "ground_plane"):
+                # The fallback ground plane from render_viewport
+                mat = mat_asphalt
+
+            # Also detect Catalunya by name fallback
+            if mat is None and ("catalunya" in osm_name or "cataluña" in osm_name):
+                mat = _mat_plaza_catalonia()
+
+            if mat is not None:
+                if not obj.material_slots:
+                    obj.data.materials.append(mat)
+                else:
+                    obj.material_slots[0].material = mat
+                objects_created += 1
+
+        # Ensure the GroundPlane (created by render_viewport) gets asphalt
+        gp = scene.objects.get("GroundPlane")
+        if gp and gp.type == "MESH":
+            if not gp.material_slots:
+                gp.data.materials.append(mat_asphalt)
+            else:
+                gp.material_slots[0].material = mat_asphalt
+
+        return {"objects_updated": objects_created}
+
+    # ── add_facade_textures ───────────────────────────────────────────────────
+
+    def add_facade_textures(self):
+        """UV-project building footprints, add window frames, floor bands, age-based style."""
+        import bmesh as _bm
+        import math
+
+        scene = bpy.context.scene
+        processed = 0
+        skipped = []
+
+        # ── material factories keyed by era ──────────────────────────────────
+        def _era_from_obj(obj):
+            raw = str(obj.get("osm_start_date", obj.get("osm_construction_date", "")))
+            # strip non-numeric prefix/suffix; take first 4-digit run
+            import re as _re
+            m = _re.search(r'\d{4}', raw)
+            if m:
+                try:
+                    return int(m.group())
+                except ValueError:
+                    pass
+            return None  # unknown
+
+        def _get_or_build_mat(name, build_fn):
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            mat.node_tree.nodes.clear()
+            build_fn(mat)
+            return mat
+
+        def _build_stone(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (600,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (300,0)
+            bsdf.inputs["Base Color"].default_value = (0.78, 0.74, 0.66, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.80
+            # Voronoi for carved-stone look
+            vor = nt.nodes.new("ShaderNodeTexVoronoi"); vor.location = (-200,0)
+            vor.inputs["Scale"].default_value = 12.0
+            bump = nt.nodes.new("ShaderNodeBump"); bump.location = (0,-200)
+            bump.inputs["Strength"].default_value = 0.3
+            nt.links.new(vor.outputs["Distance"], bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"],  bsdf.inputs["Normal"])
+            nt.links.new(bsdf.outputs["BSDF"],    out.inputs["Surface"])
+
+        def _build_brutalist(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (600,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (300,0)
+            bsdf.inputs["Base Color"].default_value = (0.48, 0.47, 0.45, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.92
+            # ShaderNodeTexMusgrave removed in Blender 4.x; use Noise instead
+            noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-300, 0)
+            noise.inputs["Scale"].default_value  = 30.0
+            noise.inputs["Detail"].default_value = 6.0
+            mr  = nt.nodes.new("ShaderNodeMapRange"); mr.location = (-100,0)
+            mr.inputs["To Min"].default_value = 0.80
+            mr.inputs["To Max"].default_value = 0.98
+            nt.links.new(noise.outputs["Fac"],     mr.inputs["Value"])
+            nt.links.new(mr.outputs["Result"],     bsdf.inputs["Roughness"])
+            nt.links.new(bsdf.outputs["BSDF"],     out.inputs["Surface"])
+
+        def _build_modern(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (600,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (300,0)
+            bsdf.inputs["Base Color"].default_value = (0.65, 0.78, 0.88, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.05
+            bsdf.inputs["Metallic"].default_value   = 0.10
+            if "Transmission Weight" in bsdf.inputs:
+                bsdf.inputs["Transmission Weight"].default_value = 0.6
+            elif "Transmission" in bsdf.inputs:
+                bsdf.inputs["Transmission"].default_value = 0.6
+            fresnel = nt.nodes.new("ShaderNodeFresnel"); fresnel.location = (-200, -150)
+            fresnel.inputs["IOR"].default_value = 1.52
+            nt.links.new(fresnel.outputs["Fac"], bsdf.inputs["Roughness"])
+            nt.links.new(bsdf.outputs["BSDF"],   out.inputs["Surface"])
+
+        def _build_frame_mat(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (400,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (200,0)
+            bsdf.inputs["Base Color"].default_value = (0.10, 0.10, 0.11, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.30
+            bsdf.inputs["Metallic"].default_value   = 0.80
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+        def _build_band_mat(mat):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (400,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (200,0)
+            bsdf.inputs["Base Color"].default_value = (0.55, 0.53, 0.50, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.70
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+        mat_frame = _get_or_build_mat("mat_window_frame",   _build_frame_mat)
+        mat_band  = _get_or_build_mat("mat_floor_band",     _build_band_mat)
+
+        buildings = [o for o in scene.objects
+                     if o.type == "MESH" and o.get("osm_layer") == "buildings"]
+
+        for obj in buildings:
+            try:
+                mesh = obj.data
+                era  = _era_from_obj(obj)
+
+                # ── Pick era material ─────────────────────────────────────────
+                if era is not None and era < 1940:
+                    mat_name = f"mat_facade_stone_{obj.name}"
+                    era_build = _build_stone
+                elif era is not None and era <= 1980:
+                    mat_name = f"mat_facade_brutalist_{obj.name}"
+                    era_build = _build_brutalist
+                else:
+                    mat_name = f"mat_facade_modern_{obj.name}"
+                    era_build = _build_modern
+
+                mat_facade = _get_or_build_mat(mat_name, era_build)
+
+                # Ensure two material slots: 0=facade, 1=window-frame, 2=band
+                while len(mesh.materials) < 3:
+                    mesh.materials.append(None)
+                mesh.materials[0] = mat_facade
+                mesh.materials[1] = mat_frame
+                mesh.materials[2] = mat_band
+
+                # ── UV: project footprint coords onto facade faces ────────────
+                # Use world-space XY of each face center as UV, normalised by
+                # building bbox so UVs are 0-1 within the footprint.
+                if not mesh.uv_layers:
+                    mesh.uv_layers.new(name="UVMap")
+                uv_layer = mesh.uv_layers.active
+                _bb_raw = self._get_aabb(obj)
+                # _get_aabb returns [min_list, max_list]; normalise to dict
+                if isinstance(_bb_raw, list):
+                    bb = {"min": _bb_raw[0], "max": _bb_raw[1]}
+                else:
+                    bb = _bb_raw
+                bb_min_x = bb["min"][0]; bb_max_x = bb["max"][0]
+                bb_min_y = bb["min"][1]; bb_max_y = bb["max"][1]
+                bb_min_z = bb["min"][2]; bb_max_z = bb["max"][2]
+                span_x = max(bb_max_x - bb_min_x, 0.01)
+                span_z = max(bb_max_z - bb_min_z, 0.01)
+
+                for poly in mesh.polygons:
+                    world_center = obj.matrix_world @ poly.center
+                    for li in poly.loop_indices:
+                        wco = obj.matrix_world @ mesh.vertices[mesh.loops[li].vertex_index].co
+                        # Facade faces (side): U=horiz world-pos, V=height
+                        if abs(poly.normal.z) < 0.3:
+                            u = (wco.x - bb_min_x) / span_x
+                            v = (wco.z - bb_min_z) / span_z
+                        else:
+                            # Top/bottom: U=X, V=Y
+                            bb_sy = max(bb_max_y - bb_min_y, 0.01)
+                            u = (wco.x - bb_min_x) / span_x
+                            v = (wco.y - bb["min"][1]) / bb_sy
+                        uv_layer.data[li].uv = (u, v)
+
+                # ── Window frames and floor bands via bmesh ───────────────────
+                bme = _bm.new()
+                bme.from_mesh(mesh)
+                bme.verts.ensure_lookup_table()
+                bme.edges.ensure_lookup_table()
+                bme.faces.ensure_lookup_table()
+
+                # Assign material indices
+                # Side faces that look like window insets (small, roughly square) → frame mat
+                zmax = max((v.co.z for v in bme.verts), default=0)
+                floor_h = 3.0
+
+                for f in bme.faces:
+                    if abs(f.normal.z) < 0.3:  # side face
+                        area = f.calc_area()
+                        cz   = f.calc_center_median().z
+                        # Window insets: small area side faces
+                        if 0.05 < area < 3.0:
+                            f.material_index = 1  # window frame
+                        # Floor-band faces: near floor cut heights
+                        elif area > 0.0:
+                            floor_idx = round(cz / floor_h)
+                            band_z    = floor_idx * floor_h
+                            if abs(cz - band_z) < 0.12 and area < 1.5:
+                                f.material_index = 2  # floor band
+                            else:
+                                f.material_index = 0  # facade
+                    else:
+                        f.material_index = 0  # top/bottom → facade
+
+                # Extrude floor-band faces outward by 0.1 m
+                band_faces = [f for f in bme.faces if f.material_index == 2]
+                if band_faces:
+                    ext = _bm.ops.extrude_face_region(bme, geom=band_faces)
+                    ext_verts = [e for e in ext["geom"] if isinstance(e, _bm.types.BMVert)]
+                    # Translate in the face normal direction
+                    for v in ext_verts:
+                        # Average normals of linked faces
+                        avg_n = mathutils.Vector((0, 0, 0))
+                        for lf in v.link_faces:
+                            if abs(lf.normal.z) < 0.3:
+                                avg_n += lf.normal
+                        if avg_n.length > 0.01:
+                            avg_n.normalize()
+                            v.co += avg_n * 0.1
+
+                _bm.ops.recalc_face_normals(bme, faces=bme.faces[:])
+                bme.to_mesh(mesh)
+                bme.free()
+                mesh.update()
+                processed += 1
+
+            except Exception as exc:
+                skipped.append({"object": obj.name, "error": str(exc)})
+
+        return {
+            "processed": processed,
+            "skipped_count": len(skipped),
+            "skipped": skipped[:10],
+        }
+
+    # ── add_ambient_occlusion ─────────────────────────────────────────────────
+
+    def add_ambient_occlusion(self):
+        """Bake AO into vertex colours and wire a VertexColor × BaseColor multiply into all materials."""
+        import math
+
+        scene  = bpy.context.scene
+        render = scene.render
+        ao_attr = "Col"  # vertex colour attribute name
+
+        # We need Cycles for baking
+        prev_engine = render.engine
+        render.engine = "CYCLES"
+        scene.cycles.samples = 32
+
+        mesh_objs = [o for o in scene.objects if o.type == "MESH"]
+        baked_count = 0
+        skipped = []
+
+        for obj in mesh_objs:
+            try:
+                mesh = obj.data
+
+                # Add / reuse vertex colour attribute
+                if ao_attr not in mesh.color_attributes:
+                    mesh.color_attributes.new(name=ao_attr, type='FLOAT_COLOR', domain='CORNER')
+
+                # Select only this object for baking
+                bpy.ops.object.select_all(action='DESELECT')
+                bpy.context.view_layer.objects.active = obj
+                obj.select_set(True)
+
+                # Bake AO
+                bpy.ops.object.bake(
+                    type='AO',
+                    use_selected_to_active=False,
+                    target='VERTEX_COLORS',
+                    save_mode='INTERNAL',
+                )
+                baked_count += 1
+            except Exception as exc:
+                skipped.append({"object": obj.name, "error": str(exc)})
+
+        # Restore engine
+        render.engine = prev_engine
+
+        # ── Wire vertex colour × base colour into all materials ───────────────
+        wired = 0
+        AO_FACTOR = 0.7
+
+        for mat in bpy.data.materials:
+            if not mat.use_nodes:
+                continue
+            nt = mat.node_tree
+
+            # Find Principled BSDF (if any)
+            pbsdf = next(
+                (n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"),
+                None,
+            )
+            if pbsdf is None:
+                continue
+
+            # Check if AO node already wired
+            already = any(
+                n.type == "ATTRIBUTE" and n.attribute_name == ao_attr
+                for n in nt.nodes
+            )
+            if already:
+                continue
+
+            # Get the current Base Color input link
+            base_in = pbsdf.inputs["Base Color"]
+
+            # Add nodes
+            ao_node  = nt.nodes.new("ShaderNodeAttribute");   ao_node.attribute_name = ao_attr
+            ao_node.location = (pbsdf.location.x - 450, pbsdf.location.y - 200)
+
+            mul_node = nt.nodes.new("ShaderNodeMixRGB")
+            mul_node.blend_type = 'MULTIPLY'
+            mul_node.inputs["Fac"].default_value = AO_FACTOR
+            mul_node.location = (pbsdf.location.x - 220, pbsdf.location.y - 100)
+
+            # Preserve existing base colour link or default value
+            if base_in.links:
+                prev_link = base_in.links[0]
+                nt.links.new(prev_link.from_socket,    mul_node.inputs["Color1"])
+                nt.links.remove(prev_link)
+            else:
+                mul_node.inputs["Color1"].default_value = base_in.default_value
+
+            nt.links.new(ao_node.outputs["Color"],     mul_node.inputs["Color2"])
+            nt.links.new(mul_node.outputs["Color"],    base_in)
+            wired += 1
+
+        return {
+            "baked_count": baked_count,
+            "materials_wired": wired,
+            "skipped_count": len(skipped),
+            "skipped": skipped[:10],
+        }
+
+    # ── add_road_geometry ─────────────────────────────────────────────────────
+
+    def add_road_geometry(self):
+        """Convert road-edge objects into proper width meshes with camber and lane markings."""
+        import bmesh as _bm
+        import math
+
+        scene = bpy.context.scene
+
+        # Width table (metres) keyed on osm_highway value
+        WIDTHS = {
+            "motorway": 14.0, "motorway_link": 10.0,
+            "trunk": 14.0,    "trunk_link": 10.0,
+            "primary": 10.0,  "primary_link": 8.0,
+            "secondary": 10.0,"secondary_link": 8.0,
+            "tertiary": 6.0,  "tertiary_link": 5.0,
+            "residential": 6.0, "living_street": 5.0,
+            "service": 4.0,   "track": 3.0,
+            "footway": 2.0,   "path": 2.0,
+            "cycleway": 2.0,  "pedestrian": 4.0,
+            "steps": 1.5,     "unclassified": 6.0,
+        }
+        DEFAULT_WIDTH = 6.0
+        CAMBER = 0.02   # 2 % cross-slope
+
+        def _road_mat():
+            name = "mat_road_proper"
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nt = mat.node_tree; nt.nodes.clear()
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (500,0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (200,0)
+            bsdf.inputs["Base Color"].default_value = (0.07, 0.07, 0.07, 1.0)
+            bsdf.inputs["Roughness"].default_value  = 0.95
+            noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-200,-100)
+            noise.inputs["Scale"].default_value = 50.0
+            bump  = nt.nodes.new("ShaderNodeBump");   bump.location  = (0,-150)
+            bump.inputs["Strength"].default_value = 0.08
+            nt.links.new(noise.outputs["Fac"],  bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"],bsdf.inputs["Normal"])
+            nt.links.new(bsdf.outputs["BSDF"],  out.inputs["Surface"])
+            return mat
+
+        def _marking_mat():
+            name = "mat_lane_marking"
+            if name in bpy.data.materials:
+                return bpy.data.materials[name]
+            mat = bpy.data.materials.new(name)
+            mat.use_nodes = True
+            nt = mat.node_tree; nt.nodes.clear()
+            out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (400,0)
+            em  = nt.nodes.new("ShaderNodeEmission");      em.location  = (200,0)
+            em.inputs["Color"].default_value    = (0.95, 0.95, 0.90, 1.0)
+            em.inputs["Strength"].default_value = 0.5
+            nt.links.new(em.outputs["Emission"], out.inputs["Surface"])
+            return mat
+
+        mat_road    = _road_mat()
+        mat_marking = _marking_mat()
+
+        road_objs = [o for o in scene.objects
+                     if o.type == "MESH" and o.get("osm_layer") == "roads"]
+
+        roads_created   = 0
+        markings_created = 0
+
+        for src_obj in road_objs:
+            hw_tag = str(src_obj.get("osm_highway", "")).lower()
+            width  = WIDTHS.get(hw_tag, DEFAULT_WIDTH)
+            hw     = hw_tag
+
+            mesh = src_obj.data
+            bme  = _bm.new()
+            bme.from_mesh(mesh)
+            bme.transform(src_obj.matrix_world)
+            bme.edges.ensure_lookup_table()
+            bme.verts.ensure_lookup_table()
+
+            road_verts  = []
+            road_faces  = []
+            mark_verts  = []
+            mark_faces  = []
+            vi = 0
+
+            for edge in bme.edges:
+                v0 = edge.verts[0].co.copy()
+                v1 = edge.verts[1].co.copy()
+                seg = v1 - v0
+                seg_len = seg.length
+                if seg_len < 0.1:
+                    continue
+                seg_dir = seg.normalized()
+                perp    = mathutils.Vector((-seg_dir.y, seg_dir.x, 0.0))
+
+                half_w = width / 2.0
+                # Road surface with camber: centre higher than edges
+                # Left edge: p0 - perp*half_w, z -= camber*half_w
+                # Right edge: p0 + perp*half_w, z -= camber*half_w
+                def _pt(base, side, z_off):
+                    return mathutils.Vector((
+                        base.x + perp.x * side,
+                        base.y + perp.y * side,
+                        max(base.z + z_off, 0.0),
+                    ))
+
+                # 5-vert cross-section: left edge, left shoulder, centre, right shoulder, right edge
+                sections = [
+                    (_pt(v0, -half_w,       -CAMBER * half_w),
+                     _pt(v0,  0.0,           0.0),
+                     _pt(v0,  half_w,        -CAMBER * half_w)),
+                    (_pt(v1, -half_w,       -CAMBER * half_w),
+                     _pt(v1,  0.0,           0.0),
+                     _pt(v1,  half_w,        -CAMBER * half_w)),
+                ]
+                # Left half quad
+                road_verts.extend([sections[0][0], sections[0][1],
+                                   sections[1][1], sections[1][0]])
+                road_faces.append([vi, vi+1, vi+2, vi+3]); vi += 4
+                # Right half quad
+                road_verts.extend([sections[0][1], sections[0][2],
+                                   sections[1][2], sections[1][1]])
+                road_faces.append([vi, vi+1, vi+2, vi+3]); vi += 4
+
+                # Lane markings: dashed centreline, 0.15 m wide, every 3 m
+                if hw not in ("footway", "path", "steps"):
+                    t = 0.0
+                    dash = True  # alternate dash / gap
+                    while t < seg_len:
+                        next_t = min(t + 1.5, seg_len)
+                        if dash:
+                            frac0 = t      / seg_len
+                            frac1 = next_t / seg_len
+                            c0 = v0.lerp(v1, frac0)
+                            c1 = v0.lerp(v1, frac1)
+                            p0 = c0 + perp * (-0.075) + mathutils.Vector((0,0,0.01))
+                            p1 = c1 + perp * (-0.075) + mathutils.Vector((0,0,0.01))
+                            p2 = c1 + perp * ( 0.075) + mathutils.Vector((0,0,0.01))
+                            p3 = c0 + perp * ( 0.075) + mathutils.Vector((0,0,0.01))
+                            mark_verts.extend([p0,p1,p2,p3])
+                            mvi = len(mark_verts) - 4
+                            mark_faces.append([mvi, mvi+1, mvi+2, mvi+3])
+                        t    += 1.5
+                        dash  = not dash
+
+            bme.free()
+
+            if not road_verts:
+                continue
+
+            # Build road mesh
+            rm = bpy.data.meshes.new(f"RoadMesh_{src_obj.name}")
+            rm.from_pydata(
+                [v.to_tuple() for v in road_verts],
+                [],
+                road_faces,
+            )
+            rm.update()
+            rm.materials.append(mat_road)
+            ro = bpy.data.objects.new(f"RoadMesh_{src_obj.name}", rm)
+            ro["osm_layer"]   = "roads"
+            ro["osm_highway"] = hw_tag
+            scene.collection.objects.link(ro)
+            roads_created += 1
+
+            if mark_verts:
+                mm = bpy.data.meshes.new(f"LaneMarkings_{src_obj.name}")
+                mm.from_pydata(
+                    [v.to_tuple() for v in mark_verts],
+                    [],
+                    mark_faces,
+                )
+                mm.update()
+                mm.materials.append(mat_marking)
+                mo = bpy.data.objects.new(f"LaneMarkings_{src_obj.name}", mm)
+                scene.collection.objects.link(mo)
+                markings_created += 1
+
+        return {
+            "road_meshes_created": roads_created,
+            "marking_meshes_created": markings_created,
+            "roads_processed": len(road_objs),
+        }
+
+    # ── add_lighting_setup ────────────────────────────────────────────────────
+
+    def add_lighting_setup(self, time_of_day="golden_hour"):
+        """Configure scene lighting for the requested time of day."""
+        import math
+        import random
+
+        scene = bpy.context.scene
+
+        # ── Remove previous city lighting objects ─────────────────────────────
+        for obj in list(scene.objects):
+            if obj.get("city_light"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        # ── World node tree ───────────────────────────────────────────────────
+        world = bpy.data.worlds.get("World") or bpy.data.worlds.new("World")
+        scene.world = world
+        world.use_nodes = True
+        nt = world.node_tree
+        nt.nodes.clear()
+
+        out = nt.nodes.new("ShaderNodeOutputWorld"); out.location = (600,0)
+
+        # Hemisphere fill light (always present, blue sky tone)
+        bg_sky = nt.nodes.new("ShaderNodeBackground"); bg_sky.location = (400,100)
+        bg_sky.inputs["Color"].default_value    = (0.35, 0.50, 0.80, 1.0)
+        bg_sky.inputs["Strength"].default_value = 0.5
+
+        mix_world = nt.nodes.new("ShaderNodeMixShader"); mix_world.location = (500, 0)
+        mix_world.inputs["Fac"].default_value = 0.8
+
+        # Sun / main light
+        bg_sun = nt.nodes.new("ShaderNodeBackground"); bg_sun.location = (300, -100)
+
+        nt.links.new(bg_sky.outputs["Background"], mix_world.inputs[1])
+        nt.links.new(bg_sun.outputs["Background"], mix_world.inputs[2])
+        nt.links.new(mix_world.outputs["Shader"],  out.inputs["Surface"])
+
+        lights_added = 0
+
+        tod = time_of_day.lower()
+
+        if tod == "noon":
+            elevation_deg = 70.0
+            sun_color     = (1.00, 1.00, 0.98, 1.0)
+            sun_strength  = 5.0
+            bg_sky.inputs["Strength"].default_value = 0.4
+        elif tod == "morning":
+            elevation_deg = 20.0
+            sun_color     = (0.85, 0.92, 1.00, 1.0)
+            sun_strength  = 4.0
+            bg_sky.inputs["Color"].default_value    = (0.40, 0.55, 0.80, 1.0)
+            bg_sky.inputs["Strength"].default_value = 0.35
+        elif tod == "night":
+            elevation_deg = -10.0  # sun below horizon = no direct light
+            sun_color     = (0.05, 0.05, 0.15, 1.0)
+            sun_strength  = 0.0
+            bg_sky.inputs["Color"].default_value    = (0.02, 0.03, 0.10, 1.0)
+            bg_sky.inputs["Strength"].default_value = 0.05
+        else:  # golden_hour (default)
+            elevation_deg = 8.0
+            sun_color     = (1.00, 0.85, 0.60, 1.0)
+            sun_strength  = 3.0
+            bg_sky.inputs["Color"].default_value    = (0.50, 0.55, 0.80, 1.0)
+            bg_sky.inputs["Strength"].default_value = 0.45
+
+        bg_sun.inputs["Color"].default_value    = sun_color
+        bg_sun.inputs["Strength"].default_value = sun_strength
+
+        # ── Sun lamp ─────────────────────────────────────────────────────────
+        if sun_strength > 0.01:
+            origin_lon = scene.get("geo_origin_lon", 0.0)
+            sun_data = bpy.data.lights.new("CityLightSun", type='SUN')
+            sun_data.energy = sun_strength
+            sun_data.color  = sun_color[:3]
+            sun_data.angle  = math.radians(0.53)
+            sun_obj = bpy.data.objects.new("CityLightSun", sun_data)
+            sun_obj["city_light"] = True
+            scene.collection.objects.link(sun_obj)
+            sun_obj.rotation_euler = (
+                math.radians(90.0 - elevation_deg),
+                0.0,
+                math.radians(origin_lon % 360),
+            )
+            lights_added += 1
+
+        # ── Night-mode extras ─────────────────────────────────────────────────
+        if tod == "night":
+            rng = random.Random(7)
+
+            road_objs = [o for o in scene.objects
+                         if o.type == "MESH" and o.get("osm_layer") in ("roads",)]
+
+            # Street lamps every 20 m along road edges
+            lamp_positions = []
+            for road_obj in road_objs:
+                mesh = road_obj.data
+                for edge in mesh.edges:
+                    v0 = road_obj.matrix_world @ mesh.vertices[edge.vertices[0]].co
+                    v1 = road_obj.matrix_world @ mesh.vertices[edge.vertices[1]].co
+                    seg_len = (v1 - v0).length
+                    t = 0.0
+                    while t < seg_len:
+                        frac = t / seg_len if seg_len > 0 else 0
+                        pos  = v0.lerp(v1, frac)
+                        pos.z = 5.5  # lamp height
+                        lamp_positions.append(pos.copy())
+                        t += 20.0
+
+            for pos in lamp_positions:
+                ld = bpy.data.lights.new("StreetLamp", type='POINT')
+                ld.energy       = 100.0
+                ld.color        = (1.0, 0.88, 0.60)  # 2700 K warm
+                ld.shadow_soft_size = 0.3
+                lo = bpy.data.objects.new("StreetLamp", ld)
+                lo["city_light"] = True
+                lo.location = pos
+                scene.collection.objects.link(lo)
+                lights_added += 1
+
+            # Lit windows: emission on 30% of window-frame material faces
+            # We add a per-material emit variant rather than modifying geometry
+            window_mats = [m for m in bpy.data.materials
+                           if "window_frame" in m.name.lower() or "glass" in m.name.lower()]
+            lit_mats = 0
+            for mat in window_mats:
+                if not mat.use_nodes:
+                    continue
+                # Add a night-emission variant if not already present
+                night_name = f"{mat.name}_night"
+                if night_name in bpy.data.materials:
+                    continue
+                night_mat = bpy.data.materials.new(night_name)
+                night_mat.use_nodes = True
+                nnt = night_mat.node_tree; nnt.nodes.clear()
+                nout = nnt.nodes.new("ShaderNodeOutputMaterial"); nout.location = (400,0)
+                nem  = nnt.nodes.new("ShaderNodeEmission");       nem.location  = (200,0)
+                # Warm interior light colour
+                nem.inputs["Color"].default_value    = (1.0, 0.90, 0.70, 1.0)
+                nem.inputs["Strength"].default_value = 2.0
+                nnt.links.new(nem.outputs["Emission"], nout.inputs["Surface"])
+                lit_mats += 1
+
+        return {
+            "time_of_day": tod,
+            "lights_added": lights_added,
+        }
+
+    # ── generate_facade_geometry ─────────────────────────────────────────────
+
+    def generate_facade_geometry(self, object_name=None):
+        """
+        Full procedural facade geometry system — real 3D relief vertices.
+
+        For each building (filtered by footprint area and wall-face count):
+          1. Identify vertical wall panels grouped by floor level.
+          2. Cut real window openings, add sill ledges and frame reveals.
+          3. Add balconies on south-facing residential facades every 2nd floor.
+          4. Add era-specific architectural ornament (pilasters/cornice/
+             brise-soleil/curtain-wall grid/setback/rooftop box).
+          5. Add rooftop parapet + programme-specific rooftop elements.
+          6. Assign named material slots to every geometry element.
+        """
+        import bmesh as _bm
+        import math
+        import random
+        import re as _re
+
+        scene  = bpy.context.scene
+        rng    = random.Random(12345)
+
+        # ── performance gates ─────────────────────────────────────────────────
+        AREA_SKIP      = 1000.0   # m²  — keep as LOD0
+        MIN_WALL_FACES = 4
+
+        # ── floor / window geometry constants ────────────────────────────────
+        FLOOR_H        = 3.0      # m per floor
+        WIN_W_RES      = 0.9      # residential window width
+        WIN_H_RES      = 1.4      # residential window height
+        WIN_SPACING    = 2.5      # centre-to-centre spacing
+        WIN_REVEAL     = 0.12     # inward extrusion for wall thickness reveal
+        SILL_OUT       = 0.06     # sill protrusion outward
+        SILL_H         = 0.10     # sill height
+        BAL_DEPTH      = 0.90     # balcony slab depth
+        BAL_THICK      = 0.15     # balcony slab thickness
+        RAIL_H         = 1.00     # railing height
+        RAIL_SPACING   = 0.15     # vertical bar spacing
+        RAIL_R         = 0.02     # bar radius
+
+        # ── shared material registry ──────────────────────────────────────────
+        _mat_cache: dict = {}
+
+        def _mat(name: str, build_fn):
+            if name in _mat_cache:
+                return _mat_cache[name]
+            if name in bpy.data.materials:
+                m = bpy.data.materials[name]
+            else:
+                m = bpy.data.materials.new(name)
+                m.use_nodes = True
+                m.node_tree.nodes.clear()
+                build_fn(m)
+            _mat_cache[name] = m
+            return m
+
+        def _pbsdf(mat, base_color, roughness=0.8, metallic=0.0,
+                   transmission=0.0, alpha=1.0):
+            nt = mat.node_tree
+            out  = nt.nodes.new("ShaderNodeOutputMaterial"); out.location  = (400, 0)
+            bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (100, 0)
+            bsdf.inputs["Base Color"].default_value = (*base_color, 1.0)
+            bsdf.inputs["Roughness"].default_value  = roughness
+            bsdf.inputs["Metallic"].default_value   = metallic
+            for key in ("Transmission Weight", "Transmission"):
+                if key in bsdf.inputs:
+                    bsdf.inputs[key].default_value = transmission
+                    break
+            bsdf.inputs["Alpha"].default_value = alpha
+            nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            return bsdf
+
+        def _mat_wall_stone(m):
+            bsdf = _pbsdf(m, (0.76, 0.72, 0.64), roughness=0.80)
+            nt = m.node_tree
+            vor = nt.nodes.new("ShaderNodeTexVoronoi"); vor.location = (-300, 0)
+            vor.inputs["Scale"].default_value = 10.0
+            bump = nt.nodes.new("ShaderNodeBump"); bump.location = (-100, -200)
+            bump.inputs["Strength"].default_value = 0.25
+            nt.links.new(vor.outputs["Distance"], bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"],  bsdf.inputs["Normal"])
+
+        def _mat_wall_brick(m):
+            bsdf = _pbsdf(m, (0.60, 0.28, 0.18), roughness=0.90)
+            nt = m.node_tree
+            noise = nt.nodes.new("ShaderNodeTexNoise"); noise.location = (-300, 0)
+            noise.inputs["Scale"].default_value = 60.0
+            bump  = nt.nodes.new("ShaderNodeBump");   bump.location  = (-100, -200)
+            bump.inputs["Strength"].default_value = 0.20
+            nt.links.new(noise.outputs["Fac"],   bump.inputs["Height"])
+            nt.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+
+        def _mat_wall_concrete(m):
+            bsdf = _pbsdf(m, (0.50, 0.48, 0.46), roughness=0.92)
+            nt = m.node_tree
+            mus = nt.nodes.new("ShaderNodeTexNoise"); mus.location = (-300, 0)
+            mus.inputs["Scale"].default_value = 25.0
+            mus.inputs["Detail"].default_value = 6.0
+            mr  = nt.nodes.new("ShaderNodeMapRange");   mr.location  = (-100, 0)
+            mr.inputs["To Min"].default_value = 0.82
+            mr.inputs["To Max"].default_value = 0.96
+            nt.links.new(mus.outputs["Fac"],       mr.inputs["Value"])
+            nt.links.new(mr.outputs["Result"],     bsdf.inputs["Roughness"])
+
+        def _mat_wall_glass_curtain(m):
+            bsdf = _pbsdf(m, (0.60, 0.75, 0.88), roughness=0.04,
+                          metallic=0.05, transmission=0.75)
+
+        def _mat_window_glass(m):
+            bsdf = _pbsdf(m, (0.55, 0.70, 0.85), roughness=0.02, transmission=0.90)
+            m.blend_method = "BLEND"
+
+        def _mat_window_frame_alu(m):
+            _pbsdf(m, (0.12, 0.12, 0.13), roughness=0.20, metallic=0.90)
+
+        def _mat_balcony_concrete(m):
+            _pbsdf(m, (0.58, 0.56, 0.54), roughness=0.85)
+
+        def _mat_balcony_railing(m):
+            _pbsdf(m, (0.18, 0.18, 0.20), roughness=0.15, metallic=0.95)
+
+        def _mat_cornice_stone(m):
+            _pbsdf(m, (0.82, 0.78, 0.70), roughness=0.75)
+
+        def _mat_roof_gravel(m):
+            bsdf = _pbsdf(m, (0.42, 0.40, 0.37), roughness=0.97)
+            nt = m.node_tree
+            mus = nt.nodes.new("ShaderNodeTexNoise"); mus.location = (-300, 0)
+            mus.inputs["Scale"].default_value = 40.0
+            mus.inputs["Detail"].default_value = 4.0
+            nt.links.new(mus.outputs["Fac"], bsdf.inputs["Roughness"])
+
+        def _mat_brise_soleil(m):
+            _pbsdf(m, (0.30, 0.30, 0.32), roughness=0.30, metallic=0.70)
+
+        # Pre-build the shared materials once
+        MAT_WALL_STONE   = _mat("facade_wall_stone",         _mat_wall_stone)
+        MAT_WALL_BRICK   = _mat("facade_wall_brick",         _mat_wall_brick)
+        MAT_WALL_CONC    = _mat("facade_wall_concrete",      _mat_wall_concrete)
+        MAT_WALL_CURTAIN = _mat("facade_wall_glass_curtain", _mat_wall_glass_curtain)
+        MAT_WIN_GLASS    = _mat("facade_window_glass",       _mat_window_glass)
+        MAT_WIN_FRAME    = _mat("facade_window_frame_aluminium", _mat_window_frame_alu)
+        MAT_BAL_CONC     = _mat("facade_balcony_concrete",   _mat_balcony_concrete)
+        MAT_BAL_RAIL     = _mat("facade_balcony_railing",    _mat_balcony_railing)
+        MAT_CORNICE      = _mat("facade_cornice_stone",      _mat_cornice_stone)
+        MAT_ROOF_GRAVEL  = _mat("facade_roof_gravel",        _mat_roof_gravel)
+        MAT_BRISE        = _mat("facade_brise_soleil",       _mat_brise_soleil)
+
+        # ── helpers: child mesh creation ──────────────────────────────────────
+
+        def _child_obj(name, verts, faces, mat, parent_obj):
+            """Create a mesh child object from raw vert/face lists."""
+            m = bpy.data.meshes.new(name)
+            m.from_pydata([v.to_tuple() if hasattr(v, 'to_tuple') else tuple(v)
+                           for v in verts], [], faces)
+            m.update()
+            m.materials.append(mat)
+            o = bpy.data.objects.new(name, m)
+            o["facade_child"] = True
+            scene.collection.objects.link(o)
+            o.parent = parent_obj
+            o.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+            return o
+
+        def _cylinder_verts(center, radius, height, segments=8):
+            """Return (verts, faces) for a vertical cylinder in world space."""
+            verts = []
+            faces = []
+            for i in range(segments):
+                a = 2 * math.pi * i / segments
+                verts.append(mathutils.Vector((center.x + math.cos(a)*radius,
+                                               center.y + math.sin(a)*radius,
+                                               center.z)))
+                verts.append(mathutils.Vector((center.x + math.cos(a)*radius,
+                                               center.y + math.sin(a)*radius,
+                                               center.z + height)))
+            for i in range(segments):
+                n  = (i + 1) % segments
+                b0 = i * 2;  b1 = b0 + 1
+                b2 = n * 2;  b3 = b2 + 1
+                faces.append([b0, b2, b3, b1])
+            # bottom / top caps
+            faces.append(list(range(0, segments*2, 2)))
+            faces.append(list(range(1, segments*2, 2))[::-1])
+            return verts, faces
+
+        def _box_verts(origin, sx, sy, sz):
+            """Return (verts, faces) for an axis-aligned box."""
+            x, y, z = origin.x, origin.y, origin.z
+            v = [
+                mathutils.Vector((x,    y,    z   )),
+                mathutils.Vector((x+sx, y,    z   )),
+                mathutils.Vector((x+sx, y+sy, z   )),
+                mathutils.Vector((x,    y+sy, z   )),
+                mathutils.Vector((x,    y,    z+sz)),
+                mathutils.Vector((x+sx, y,    z+sz)),
+                mathutils.Vector((x+sx, y+sy, z+sz)),
+                mathutils.Vector((x,    y+sy, z+sz)),
+            ]
+            f = [
+                [0,1,2,3],[4,7,6,5],
+                [0,4,5,1],[1,5,6,2],
+                [2,6,7,3],[3,7,4,0],
+            ]
+            return v, f
+
+        # ── era detection ─────────────────────────────────────────────────────
+
+        def _era(obj):
+            raw = str(obj.get("osm_start_date",
+                      obj.get("osm_construction_date", "")))
+            hit = _re.search(r'\d{4}', raw)
+            if hit:
+                try:
+                    return int(hit.group())
+                except ValueError:
+                    pass
+            return None   # unknown → default to contemporary
+
+        # ── footprint area (local-space shoelace) ─────────────────────────────
+
+        def _footprint_area(mesh):
+            bot = [v.co for v in mesh.vertices if abs(v.co.z) < 0.2]
+            if len(bot) < 3:
+                return 0.0
+            xs = [v.x for v in bot]; ys = [v.y for v in bot]
+            n  = len(xs)
+            return abs(sum(xs[i]*ys[(i+1)%n] - xs[(i+1)%n]*ys[i]
+                           for i in range(n)) / 2.0)
+
+        # ── building use type ─────────────────────────────────────────────────
+
+        def _use(obj):
+            btype = str(obj.get("osm_building", "yes")).lower()
+            levels = obj.get("osm_building:levels", obj.get("osm_levels", None))
+            if btype in ("commercial","retail","shop"):  return "commercial"
+            if btype in ("office","government"):         return "office"
+            if btype in ("house","residential","apartments","flat"): return "residential"
+            if btype in ("industrial","warehouse","garage"): return "industrial"
+            return "residential"   # default
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # PER-BUILDING PROCESSING
+        # ═══════════════════════════════════════════════════════════════════════
+
+        if object_name:
+            targets = [bpy.data.objects.get(object_name)]
+            if targets[0] is None:
+                return {"error": f"Object '{object_name}' not found"}
+        else:
+            targets = [o for o in scene.objects
+                       if o.type == "MESH" and o.get("osm_layer") == "buildings"]
+
+        reports = []
+        total_windows   = 0
+        total_balconies = 0
+
+        for obj in targets:
+            if obj is None or obj.type != "MESH":
+                continue
+
+            rep = {
+                "object":            obj.name,
+                "faces_before":      0,
+                "faces_after":       0,
+                "style":             "unknown",
+                "windows_created":   0,
+                "balconies_created": 0,
+                "errors":            [],
+            }
+
+            try:
+                mesh = obj.data
+                rep["faces_before"] = len(mesh.polygons)
+
+                # ── performance gates ─────────────────────────────────────────
+                area = _footprint_area(mesh)
+                if area > AREA_SKIP:
+                    rep["errors"].append(f"skipped: footprint {area:.0f}m² > {AREA_SKIP}m²")
+                    reports.append(rep)
+                    continue
+
+                year = _era(obj)
+                use  = _use(obj)
+
+                if year is not None and year < 1940:
+                    style = "pre1940"
+                elif year is not None and year <= 1980:
+                    style = "brutalist"
+                else:
+                    style = "contemporary"
+                rep["style"] = style
+
+                # Pick wall material for this era
+                if style == "pre1940":
+                    wall_mat = MAT_WALL_STONE
+                elif style == "brutalist":
+                    wall_mat = MAT_WALL_CONC
+                else:
+                    if use == "office":
+                        wall_mat = MAT_WALL_CURTAIN
+                    else:
+                        wall_mat = MAT_WALL_BRICK
+
+                # Ensure enough material slots on the building mesh
+                while len(mesh.materials) < 7:
+                    mesh.materials.append(None)
+                mesh.materials[0] = wall_mat
+                mesh.materials[1] = MAT_WIN_GLASS
+                mesh.materials[2] = MAT_WIN_FRAME
+                mesh.materials[3] = MAT_BAL_CONC
+                mesh.materials[4] = MAT_CORNICE
+                mesh.materials[5] = MAT_ROOF_GRAVEL
+                mesh.materials[6] = MAT_BRISE
+
+                # Building world-space bounding box
+                bb     = self._get_aabb(obj)   # [[min],[max]]
+                bb_min = mathutils.Vector(bb[0])
+                bb_max = mathutils.Vector(bb[1])
+                height = bb_max.z - bb_min.z
+                n_floors = max(1, int(round(height / FLOOR_H)))
+
+                # ── STEP 1: identify vertical wall faces ──────────────────────
+                #
+                # We work in world space throughout so offsets are in metres.
+                # bmesh is loaded from the mesh, transformed to world space.
+                bme = _bm.new()
+                bme.from_mesh(mesh)
+                bme.transform(obj.matrix_world)
+                bme.verts.ensure_lookup_table()
+                bme.edges.ensure_lookup_table()
+                bme.faces.ensure_lookup_table()
+
+                # Group vertical faces by floor index
+                # floor_idx = int((face_center.z - bb_min.z) / FLOOR_H)
+                wall_faces_by_floor: dict = {}
+                for f in bme.faces:
+                    if abs(f.normal.z) >= 0.15:
+                        continue   # skip horizontal faces
+                    cz    = f.calc_center_median().z
+                    fidx  = max(0, int((cz - bb_min.z) / FLOOR_H))
+                    wall_faces_by_floor.setdefault(fidx, []).append(f)
+
+                # Quick gate: need at least MIN_WALL_FACES vertical faces
+                total_wall = sum(len(v) for v in wall_faces_by_floor.values())
+                if total_wall < MIN_WALL_FACES:
+                    rep["errors"].append(
+                        f"skipped: only {total_wall} wall faces found")
+                    bme.free()
+                    reports.append(rep)
+                    continue
+
+                # ── STEP 2: window openings ───────────────────────────────────
+                #
+                # For each sufficiently wide wall panel we:
+                #   a) Inset the panel's inner rect to create frame border
+                #   b) Extrude the inner (window) face inward to make a reveal
+                #   c) Assign window-glass mat index to the inset face
+                #   d) Add a separate sill mesh as a child object
+                #
+                # We avoid actual hole-cutting because it requires manifold
+                # geometry and triggers unstable bmesh boolean ops.  Instead we
+                # inset+extrude which gives the same visual depth and is robust
+                # on OSM building meshes that are often non-manifold.
+
+                windows_this = 0
+
+                for floor_idx, faces in wall_faces_by_floor.items():
+                    floor_z     = bb_min.z + floor_idx * FLOOR_H
+                    floor_top_z = floor_z + FLOOR_H
+
+                    for wf in faces:
+                        # Skip faces that are too small for a window
+                        area_face = wf.calc_area()
+                        if area_face < 1.5:
+                            continue
+
+                        # Estimate panel width from the face's bounding extent
+                        # in the dominant horizontal direction
+                        cx  = wf.calc_center_median()
+                        nrm = wf.normal.normalized()
+                        # Tangent: rotate normal 90° around Z
+                        tang = mathutils.Vector((-nrm.y, nrm.x, 0.0)).normalized()
+                        proj = [tang.dot(v.co) for v in wf.verts]
+                        panel_w = max(proj) - min(proj) if proj else 0.0
+                        panel_h = max(v.co.z for v in wf.verts) - \
+                                  min(v.co.z for v in wf.verts)
+
+                        if panel_w < 1.5:
+                            continue
+
+                        # Determine window count and dimensions
+                        if use == "commercial" and floor_idx == 0:
+                            # Shopfront: one wide window 80% panel width
+                            wins = [(panel_w * 0.80, panel_h * 0.75)]
+                        elif use == "office":
+                            # Ribbon window: 70% width, 0.8m tall
+                            wins = [(panel_w * 0.70, 0.80)]
+                        else:
+                            # Residential: evenly spaced 0.9m wide windows
+                            n_wins = max(1, int(panel_w / WIN_SPACING))
+                            wins = [(WIN_W_RES, WIN_H_RES)] * n_wins
+
+                        # For each window: inset a sub-face from the wall face
+                        for (ww, wh) in wins:
+                            # Inset thickness = half of (panel_w - ww) / n_wins
+                            horiz_margin = max(0.05, (panel_w - ww) / (2 * len(wins)))
+                            vert_margin  = max(0.05, (panel_h - wh) / 2.0)
+                            thickness    = min(horiz_margin, vert_margin, 0.4)
+
+                            try:
+                                res = _bm.ops.inset_individual(
+                                    bme,
+                                    faces=[wf],
+                                    thickness=thickness,
+                                    depth=0.0,
+                                )
+                                inner_faces = res.get("faces", [])
+                                if inner_faces:
+                                    inner = inner_faces[0]
+                                    inner.material_index = 1  # window glass
+
+                                    # Reveal: extrude inner face inward
+                                    ext = _bm.ops.extrude_face_region(
+                                        bme, geom=[inner])
+                                    ext_verts = [e for e in ext["geom"]
+                                                 if isinstance(e, _bm.types.BMVert)]
+                                    _bm.ops.translate(
+                                        bme,
+                                        vec=-nrm * WIN_REVEAL,
+                                        verts=ext_verts,
+                                    )
+                                    # Assign frame mat to the border ring faces
+                                    for bf in bme.faces:
+                                        if bf.material_index == 0 and \
+                                           bf != wf and abs(bf.normal.z) < 0.3:
+                                            # Heuristic: very small side faces
+                                            # created by the inset
+                                            if bf.calc_area() < 0.5:
+                                                bf.material_index = 2
+
+                                    windows_this += 1
+
+                                    # Sill: child mesh ledge below window
+                                    sill_center = mathutils.Vector((
+                                        cx.x - nrm.x * 0.001,
+                                        cx.y - nrm.y * 0.001,
+                                        cx.z - wh / 2.0 - SILL_H,
+                                    ))
+                                    sill_w   = ww + 0.10
+                                    sill_pos = sill_center + tang * (-sill_w / 2.0)
+                                    sv = [
+                                        sill_pos,
+                                        sill_pos + tang * sill_w,
+                                        sill_pos + tang * sill_w + nrm * (-SILL_OUT),
+                                        sill_pos                  + nrm * (-SILL_OUT),
+                                        sill_pos                  + mathutils.Vector((0,0,SILL_H)),
+                                        sill_pos + tang * sill_w  + mathutils.Vector((0,0,SILL_H)),
+                                        sill_pos + tang * sill_w  + nrm*(-SILL_OUT) + mathutils.Vector((0,0,SILL_H)),
+                                        sill_pos                  + nrm*(-SILL_OUT) + mathutils.Vector((0,0,SILL_H)),
+                                    ]
+                                    sf = [[0,1,2,3],[4,7,6,5],
+                                          [0,4,5,1],[1,5,6,2],
+                                          [2,6,7,3],[3,7,4,0]]
+                                    _child_obj(
+                                        f"Sill_{obj.name}_{windows_this}",
+                                        sv, sf, MAT_WIN_FRAME, obj)
+                            except Exception as we:
+                                rep["errors"].append(f"window err f{floor_idx}: {we}")
+
+                rep["windows_created"] = windows_this
+                total_windows += windows_this
+
+                # ── STEP 3: balconies (residential, south-facing, every 2nd floor) ──
+
+                balconies_this = 0
+
+                if use in ("residential", "apartments", "house"):
+                    for floor_idx, faces in wall_faces_by_floor.items():
+                        if floor_idx == 0:
+                            continue        # no ground-floor balconies
+                        if floor_idx % 2 != 0:
+                            continue        # only even floors
+
+                        for wf in faces:
+                            nrm = wf.normal.normalized()
+                            # South-facing: normal.y < -0.3 in Blender (Y is north)
+                            if nrm.y > -0.3:
+                                continue
+
+                            panel_w  = wf.calc_area() ** 0.5   # rough width
+                            cx       = wf.calc_center_median()
+                            tang     = mathutils.Vector((-nrm.y, nrm.x, 0.0)).normalized()
+                            proj     = [tang.dot(v.co) for v in wf.verts]
+                            actual_w = (max(proj) - min(proj)) if proj else panel_w
+                            bal_w    = max(1.2, min(actual_w - 0.2, 3.5))
+                            bal_z    = cx.z - FLOOR_H / 2.0 + 0.1
+
+                            # Slab: box extruded outward from face
+                            slab_origin = mathutils.Vector((
+                                cx.x - tang.x * bal_w / 2.0,
+                                cx.y - tang.y * bal_w / 2.0,
+                                bal_z,
+                            ))
+                            # Slab mesh: sweep outward along -normal
+                            sv = [
+                                slab_origin,
+                                slab_origin + tang * bal_w,
+                                slab_origin + tang * bal_w - nrm * BAL_DEPTH,
+                                slab_origin               - nrm * BAL_DEPTH,
+                                slab_origin               + mathutils.Vector((0,0,BAL_THICK)),
+                                slab_origin + tang*bal_w  + mathutils.Vector((0,0,BAL_THICK)),
+                                slab_origin + tang*bal_w - nrm*BAL_DEPTH + mathutils.Vector((0,0,BAL_THICK)),
+                                slab_origin             - nrm*BAL_DEPTH  + mathutils.Vector((0,0,BAL_THICK)),
+                            ]
+                            sf = [[0,1,2,3],[4,7,6,5],
+                                  [0,4,5,1],[1,5,6,2],
+                                  [2,6,7,3],[3,7,4,0]]
+                            _child_obj(
+                                f"Bal_slab_{obj.name}_{balconies_this}",
+                                sv, sf, MAT_BAL_CONC, obj)
+
+                            # Railings: vertical bars every RAIL_SPACING
+                            rng_local = rng
+                            n_bars = max(2, int(bal_w / RAIL_SPACING))
+                            bar_verts_all = []
+                            bar_faces_all = []
+                            vi_base = 0
+                            for bi in range(n_bars + 1):
+                                t_frac = bi / max(n_bars, 1)
+                                bar_x  = slab_origin.x + tang.x * t_frac * bal_w
+                                bar_y  = slab_origin.y + tang.y * t_frac * bal_w
+                                bar_z  = bal_z + BAL_THICK
+                                # Offset slightly outward from wall
+                                bar_c  = mathutils.Vector((bar_x, bar_y, bar_z))
+                                bar_c -= nrm * (BAL_DEPTH * 0.95)
+                                bv, bf = _cylinder_verts(bar_c, RAIL_R, RAIL_H, 6)
+                                bf_off = [[idx + vi_base for idx in face] for face in bf]
+                                bar_verts_all.extend(bv)
+                                bar_faces_all.extend(bf_off)
+                                vi_base += len(bv)
+                            if bar_verts_all:
+                                _child_obj(
+                                    f"Bal_railing_{obj.name}_{balconies_this}",
+                                    bar_verts_all, bar_faces_all,
+                                    MAT_BAL_RAIL, obj)
+
+                            # Top rail: thin horizontal box connecting bar tops
+                            rail_top_z = bal_z + BAL_THICK + RAIL_H - 0.04
+                            tr_origin  = slab_origin.copy()
+                            tr_origin.z = rail_top_z
+                            tr_origin  -= nrm * (BAL_DEPTH * 0.95)
+                            trv = [
+                                tr_origin,
+                                tr_origin + tang * bal_w,
+                                tr_origin + tang * bal_w + mathutils.Vector((0,0,0.04)),
+                                tr_origin               + mathutils.Vector((0,0,0.04)),
+                            ]
+                            # Extrude 0.04m in normal direction for thickness
+                            trv += [v - nrm * 0.04 for v in trv]
+                            trf = [[0,1,2,3],[4,7,6,5],
+                                   [0,4,5,1],[1,5,6,2],
+                                   [2,6,7,3],[3,7,4,0]]
+                            _child_obj(
+                                f"Bal_toprail_{obj.name}_{balconies_this}",
+                                trv, trf, MAT_BAL_RAIL, obj)
+
+                            balconies_this += 1
+
+                rep["balconies_created"] = balconies_this
+                total_balconies += balconies_this
+
+                # ── STEP 4: architectural details by era ──────────────────────
+
+                if style == "pre1940":
+                    # Pilasters: vertical strips 0.15m proud, 0.3m wide, every 3-4m
+                    for floor_idx, faces in wall_faces_by_floor.items():
+                        for wf in faces:
+                            nrm  = wf.normal.normalized()
+                            tang = mathutils.Vector((-nrm.y, nrm.x, 0.0)).normalized()
+                            proj = [tang.dot(v.co) for v in wf.verts]
+                            if not proj:
+                                continue
+                            pw   = max(proj) - min(proj)
+                            if pw < 3.0:
+                                continue
+                            cz   = wf.calc_center_median().z
+                            cx   = wf.calc_center_median()
+                            spacing = rng.uniform(3.0, 4.0)
+                            n_pil = max(1, int(pw / spacing))
+                            for pi in range(n_pil):
+                                t = (pi + 0.5) / n_pil
+                                px = cx.x + tang.x * (min(proj) + t * pw - sum(proj)/len(proj))
+                                py = cx.y + tang.y * (min(proj) + t * pw - sum(proj)/len(proj))
+                                # Pilaster as thin box
+                                pil_origin = mathutils.Vector((
+                                    px - tang.x * 0.15,
+                                    py - tang.y * 0.15,
+                                    cz - FLOOR_H / 2.0,
+                                ))
+                                pv, pf = _box_verts(
+                                    pil_origin - nrm * 0.15,
+                                    tang.x * 0.30 if abs(tang.x) > 0.01 else 0.30,
+                                    tang.y * 0.30 if abs(tang.y) > 0.01 else 0.30,
+                                    FLOOR_H,
+                                )
+                                _child_obj(
+                                    f"Pilaster_{obj.name}_{floor_idx}_{pi}",
+                                    pv, pf, MAT_WALL_STONE, obj)
+
+                    # Cornice: stepped top ledge at roof level
+                    top_faces = [f for f in bme.faces if f.normal.z > 0.85]
+                    if top_faces:
+                        for step in range(3):
+                            step_h   = 0.10
+                            step_out = 0.12 * (step + 1)
+                            try:
+                                ext = _bm.ops.extrude_face_region(
+                                    bme, geom=top_faces)
+                                ext_v = [e for e in ext["geom"]
+                                         if isinstance(e, _bm.types.BMVert)]
+                                _bm.ops.translate(bme,
+                                    vec=mathutils.Vector((0, 0, step_h)),
+                                    verts=ext_v)
+                                bme.faces.ensure_lookup_table()
+                                # outset new ring
+                                new_side = [f for f in bme.faces
+                                            if abs(f.normal.z) < 0.3
+                                            and f.calc_center_median().z > (
+                                                bb_max.z + step * step_h - 0.2)]
+                                if new_side:
+                                    _bm.ops.extrude_face_region(bme, geom=new_side)
+                                    bme.faces.ensure_lookup_table()
+                                top_faces = [f for f in bme.faces
+                                             if f.normal.z > 0.85
+                                             and f.calc_center_median().z > (
+                                                 bb_max.z + step * step_h - 0.05)]
+                                for cf in bme.faces:
+                                    if cf.calc_center_median().z > bb_max.z - 0.5:
+                                        cf.material_index = 4  # cornice mat
+                            except Exception as ce:
+                                rep["errors"].append(f"cornice step {step}: {ce}")
+                                break
+
+                elif style == "brutalist":
+                    # Brise-soleil fins: horizontal shelves above windows
+                    for floor_idx, faces in wall_faces_by_floor.items():
+                        if floor_idx == 0:
+                            continue
+                        for wf in faces:
+                            if wf.calc_area() < 2.0:
+                                continue
+                            nrm   = wf.normal.normalized()
+                            tang  = mathutils.Vector((-nrm.y, nrm.x, 0.0)).normalized()
+                            proj  = [tang.dot(v.co) for v in wf.verts]
+                            if not proj:
+                                continue
+                            pw    = max(proj) - min(proj)
+                            cz    = wf.calc_center_median().z
+                            cx_pt = wf.calc_center_median()
+                            # Fin: 0.3m deep, 0.08m thick, at top of window area
+                            fin_z  = cz + WIN_H_RES / 2.0 + 0.05
+                            left   = cx_pt + tang * (-pw / 2.0)
+                            right  = cx_pt + tang * ( pw / 2.0)
+                            fv = [
+                                left,  right,
+                                right - nrm * 0.30, left - nrm * 0.30,
+                                left  + mathutils.Vector((0, 0, 0.08)),
+                                right + mathutils.Vector((0, 0, 0.08)),
+                                right - nrm * 0.30 + mathutils.Vector((0, 0, 0.08)),
+                                left  - nrm * 0.30 + mathutils.Vector((0, 0, 0.08)),
+                            ]
+                            fv2 = [v.copy() for v in fv]
+                            for v in fv2:
+                                v.z = fin_z + (v.z - left.z)
+                            ff = [[0,1,2,3],[4,7,6,5],
+                                  [0,4,5,1],[1,5,6,2],
+                                  [2,6,7,3],[3,7,4,0]]
+                            _child_obj(
+                                f"Fin_{obj.name}_{floor_idx}",
+                                fv2, ff, MAT_BRISE, obj)
+
+                    # Flat roof parapet: 0.4m tall wall ring around roofline
+                    try:
+                        top_z = bb_max.z
+                        par_faces = [f for f in bme.faces if f.normal.z > 0.85
+                                     and abs(f.calc_center_median().z - top_z) < 0.5]
+                        if par_faces:
+                            ext = _bm.ops.extrude_face_region(bme, geom=par_faces)
+                            ext_v = [e for e in ext["geom"]
+                                     if isinstance(e, _bm.types.BMVert)]
+                            _bm.ops.translate(bme,
+                                vec=mathutils.Vector((0, 0, 0.4)),
+                                verts=ext_v)
+                            for f in bme.faces:
+                                if f.normal.z > 0.85 and \
+                                   f.calc_center_median().z > top_z + 0.1:
+                                    f.material_index = 5  # roof gravel
+                    except Exception as pe:
+                        rep["errors"].append(f"parapet: {pe}")
+
+                else:  # contemporary
+                    # Setback: top 20% stepped back 0.5m
+                    setback_z = bb_min.z + height * 0.80
+                    try:
+                        top_verts = [v for v in bme.verts if v.co.z > setback_z]
+                        if len(top_verts) >= 4:
+                            # Push top verts inward toward centroid
+                            cx_xy = mathutils.Vector((
+                                (bb_min.x + bb_max.x) / 2.0,
+                                (bb_min.y + bb_max.y) / 2.0,
+                                0.0,
+                            ))
+                            for v in top_verts:
+                                to_centre = (cx_xy - mathutils.Vector(
+                                    (v.co.x, v.co.y, 0.0))).normalized()
+                                v.co.x += to_centre.x * 0.5
+                                v.co.y += to_centre.y * 0.5
+                    except Exception as se:
+                        rep["errors"].append(f"setback: {se}")
+
+                    # Rooftop mechanical box: 40% footprint, 2m tall
+                    fp_w  = (bb_max.x - bb_min.x) * 0.40
+                    fp_d  = (bb_max.y - bb_min.y) * 0.40
+                    box_x = (bb_min.x + bb_max.x) / 2.0 - fp_w / 2.0
+                    box_y = (bb_min.y + bb_max.y) / 2.0 - fp_d / 2.0
+                    bxv, bxf = _box_verts(
+                        mathutils.Vector((box_x, box_y, bb_max.z)),
+                        fp_w, fp_d, 2.0,
+                    )
+                    _child_obj(
+                        f"RoofBox_{obj.name}", bxv, bxf,
+                        MAT_WALL_CONC, obj)
+
+                # ── STEP 5: roof details ──────────────────────────────────────
+
+                # Parapet ring (all styles — a low wall around the perimeter)
+                try:
+                    top_z    = bb_max.z
+                    roof_fcs = [f for f in bme.faces if f.normal.z > 0.85
+                                and abs(f.calc_center_median().z - top_z) < 0.5]
+                    if roof_fcs and style != "brutalist":  # brutalist does own parapet
+                        ext = _bm.ops.extrude_face_region(bme, geom=roof_fcs)
+                        ext_v = [e for e in ext["geom"]
+                                 if isinstance(e, _bm.types.BMVert)]
+                        _bm.ops.translate(bme,
+                            vec=mathutils.Vector((0, 0, 0.30)),
+                            verts=ext_v)
+                        for f in bme.faces:
+                            if f.normal.z > 0.85 and \
+                               f.calc_center_median().z > top_z + 0.1:
+                                f.material_index = 5  # roof gravel
+                except Exception as rpe:
+                    rep["errors"].append(f"roof parapet: {rpe}")
+
+                # Programme-specific rooftop elements
+                if use == "residential":
+                    # Water tank cylinder at roof corner
+                    s = rng.uniform(0.8, 1.2)
+                    tank_c = mathutils.Vector((
+                        bb_min.x + (bb_max.x - bb_min.x) * 0.15,
+                        bb_min.y + (bb_max.y - bb_min.y) * 0.15,
+                        bb_max.z + 0.30,
+                    ))
+                    tv, tf = _cylinder_verts(tank_c, 0.6 * s, 1.2 * s, 12)
+                    _child_obj(f"WaterTank_{obj.name}", tv, tf,
+                               MAT_WALL_CONC, obj)
+                    # TV antenna: thin pole
+                    ant_c = mathutils.Vector((
+                        bb_max.x - 0.3, bb_max.y - 0.3, bb_max.z + 0.30,
+                    ))
+                    av, af = _cylinder_verts(ant_c, 0.02, 2.5 * rng.uniform(0.8, 1.2), 4)
+                    _child_obj(f"Antenna_{obj.name}", av, af,
+                               MAT_BAL_RAIL, obj)
+
+                elif use == "commercial":
+                    # AC units: small boxes scattered on roof
+                    for ai in range(rng.randint(2, 5)):
+                        ax = bb_min.x + rng.uniform(0.5, bb_max.x - bb_min.x - 0.5)
+                        ay = bb_min.y + rng.uniform(0.5, bb_max.y - bb_min.y - 0.5)
+                        az = bb_max.z + 0.30
+                        s  = rng.uniform(0.8, 1.2)
+                        acv, acf = _box_verts(
+                            mathutils.Vector((ax, ay, az)),
+                            1.0*s, 0.6*s, 0.5*s,
+                        )
+                        _child_obj(f"ACUnit_{obj.name}_{ai}",
+                                   acv, acf, MAT_BRISE, obj)
+
+                    # Skylight: flat glass panel
+                    sky_x = (bb_min.x + bb_max.x) / 2.0 - 0.75
+                    sky_y = (bb_min.y + bb_max.y) / 2.0 - 0.5
+                    sky_z = bb_max.z + 0.31
+                    skv = [
+                        mathutils.Vector((sky_x,      sky_y,      sky_z)),
+                        mathutils.Vector((sky_x+1.5,  sky_y,      sky_z)),
+                        mathutils.Vector((sky_x+1.5,  sky_y+1.0,  sky_z)),
+                        mathutils.Vector((sky_x,      sky_y+1.0,  sky_z)),
+                    ]
+                    _child_obj(f"Skylight_{obj.name}", skv, [[0,1,2,3]],
+                               MAT_WIN_GLASS, obj)
+
+                # ── STEP 6: finalise bmesh → mesh ─────────────────────────────
+
+                _bm.ops.recalc_face_normals(bme, faces=bme.faces[:])
+                # Remove zero-area faces
+                zero = [f for f in bme.faces if f.calc_area() < 1e-8]
+                if zero:
+                    _bm.ops.delete(bme, geom=zero, context='FACES')
+
+                # Convert back from world to object-local space
+                bme.transform(obj.matrix_world.inverted())
+                bme.to_mesh(mesh)
+                bme.free()
+                mesh.update()
+
+                rep["faces_after"] = len(mesh.polygons)
+
+            except Exception as exc:
+                import traceback as _tb
+                rep["errors"].append(str(exc))
+                rep["errors"].append(_tb.format_exc()[-300:])
+
+            reports.append(rep)
+
+        return {
+            "buildings_processed": len(reports),
+            "total_windows":       sum(r["windows_created"]   for r in reports),
+            "total_balconies":     sum(r["balconies_created"] for r in reports),
+            "reports":             reports[:20],  # cap to avoid huge responses
+        }
+
+    # ── generate_building_detail ─────────────────────────────────────────────
+
+    def generate_building_detail(self, object_name=None, lod=None):
+        """
+        Apply LOD-based building detail to one object or all buildings.
+
+        lod=0: simple box (fast, no change to existing geometry)
+        lod=1: floor-level loop cuts + window insets
+        lod=2: floor cuts + windows + cornice + residential balconies
+
+        If lod is None, it is auto-selected by footprint area:
+          area > 500 m²  → lod 0
+          100–500 m²     → lod 1
+          < 100 m²       → lod 2
+        """
+        import bmesh as _bm
+        import math
+
+        scene = bpy.context.scene
+
+        if object_name:
+            targets = [bpy.data.objects.get(object_name)]
+            if targets[0] is None:
+                return {"error": f"Object '{object_name}' not found"}
+        else:
+            targets = [o for o in scene.objects
+                       if o.type == 'MESH' and o.get("osm_layer") == "buildings"]
+
+        processed = 0
+        skipped = []
+
+        for obj in targets:
+            try:
+                # Determine footprint area from bottom face (z≈0 verts)
+                mesh = obj.data
+                bot_verts = [v.co for v in mesh.vertices if abs(v.co.z) < 0.1]
+                if len(bot_verts) >= 3:
+                    # Shoelace formula for polygon area
+                    xs = [v.x for v in bot_verts]
+                    ys = [v.y for v in bot_verts]
+                    n = len(xs)
+                    area = abs(sum(xs[i] * ys[(i+1) % n] - xs[(i+1) % n] * ys[i]
+                                   for i in range(n)) / 2.0)
+                else:
+                    area = 0.0
+
+                # Determine LOD
+                if lod is not None:
+                    effective_lod = int(lod)
+                elif area > 500:
+                    effective_lod = 0
+                elif area > 100:
+                    effective_lod = 1
+                else:
+                    effective_lod = 2
+
+                obj["lod"] = effective_lod
+
+                if effective_lod == 0:
+                    # Still clean up normals, zero-area faces, and add UVs
+                    bme = _bm.new()
+                    bme.from_mesh(mesh)
+                    zero = [f for f in bme.faces if f.calc_area() < 1e-6]
+                    if zero:
+                        _bm.ops.delete(bme, geom=zero, context='FACES')
+                    _bm.ops.recalc_face_normals(bme, faces=bme.faces[:])
+                    bme.to_mesh(mesh)
+                    bme.free()
+                    mesh.update()
+                    bpy.context.view_layer.objects.active = obj
+                    obj.select_set(True)
+                    try:
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        bpy.ops.mesh.select_all(action='SELECT')
+                        bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        try:
+                            bpy.ops.object.mode_set(mode='OBJECT')
+                        except Exception:
+                            pass
+                    obj.select_set(False)
+                    processed += 1
+                    continue
+
+                # Get building height from existing geometry
+                zmax = max((v.co.z for v in mesh.vertices), default=10.0)
+                height_m = max(zmax, 3.0)
+                floor_h = 3.0
+                n_floors = max(1, int(height_m / floor_h))
+
+                bme = _bm.new()
+                bme.from_mesh(mesh)
+                bme.verts.ensure_lookup_table()
+                bme.edges.ensure_lookup_table()
+                bme.faces.ensure_lookup_table()
+
+                # Remove any remaining zero-area faces first
+                zero = [f for f in bme.faces if f.calc_area() < 1e-6]
+                if zero:
+                    _bm.ops.delete(bme, geom=zero, context='FACES')
+                    bme.faces.ensure_lookup_table()
+
+                # --- Floor loop cuts on vertical (side) faces ---
+                side_faces = [f for f in bme.faces
+                              if abs(f.normal.z) < 0.3 and f.calc_area() > 0.1]
+
+                for floor_idx in range(1, n_floors):
+                    cut_z = floor_idx * floor_h
+                    if cut_z >= height_m - 0.1:
+                        break
+                    # Bisect each side face at this z height
+                    geom_in = list(bme.verts) + list(bme.edges) + list(bme.faces)
+                    plane_co = mathutils.Vector((0, 0, cut_z))
+                    plane_no = mathutils.Vector((0, 0, 1))
+                    _bm.ops.bisect_plane(bme, geom=geom_in,
+                                         plane_co=plane_co, plane_no=plane_no,
+                                         clear_inner=False, clear_outer=False)
+                    bme.verts.ensure_lookup_table()
+                    bme.edges.ensure_lookup_table()
+                    bme.faces.ensure_lookup_table()
+
+                # --- Window insets (lod >= 1) ---
+                building_use = str(obj.get("osm_building:use", obj.get("osm_building", "yes"))).lower()
+                add_windows = building_use not in ("industrial", "warehouse", "garage")
+                large_windows = building_use in ("commercial", "retail", "office")
+
+                if add_windows:
+                    bme.faces.ensure_lookup_table()
+                    side_panels = [f for f in bme.faces
+                                   if abs(f.normal.z) < 0.3
+                                   and f.calc_area() > 0.5]
+                    if side_panels:
+                        thickness = 0.8 if large_windows else 0.5
+                        depth = 0.15
+                        inset_result = _bm.ops.inset_individual(
+                            bme, faces=side_panels,
+                            thickness=thickness, depth=depth)
+
+                # --- Cornice / ledge at rooftop (lod >= 2) ---
+                if effective_lod >= 2:
+                    bme.faces.ensure_lookup_table()
+                    top_faces = [f for f in bme.faces
+                                 if f.normal.z > 0.9
+                                 and abs(f.calc_center_median().z - height_m) < 0.5]
+                    if top_faces:
+                        # Extrude top faces outward slightly
+                        ext = _bm.ops.extrude_face_region(bme, geom=top_faces)
+                        ext_verts = [e for e in ext["geom"] if isinstance(e, _bm.types.BMVert)]
+                        _bm.ops.translate(bme, vec=(0, 0, 0.3), verts=ext_verts)
+                        # Outset the cornice ring
+                        bme.faces.ensure_lookup_table()
+                        cornice_faces = [f for f in bme.faces
+                                         if abs(f.normal.z) < 0.3
+                                         and f.calc_center_median().z > height_m - 0.1]
+                        if cornice_faces:
+                            _bm.ops.inset_region(bme, faces=cornice_faces,
+                                                thickness=-0.3, depth=0.0)
+
+                    # --- Balconies on residential buildings (lod 2 only) ---
+                    if building_use in ("residential", "apartments", "house", "yes"):
+                        bme.faces.ensure_lookup_table()
+                        balcony_candidates = [f for f in bme.faces
+                                              if abs(f.normal.z) < 0.3
+                                              and f.calc_area() > 1.5
+                                              and 2.5 < f.calc_center_median().z < height_m - 1.0]
+                        # Inset to create balcony slab on every other floor panel
+                        step = max(1, len(balcony_candidates) // max(n_floors, 1))
+                        balcony_faces = balcony_candidates[::step * 2]
+                        if balcony_faces:
+                            _bm.ops.inset_individual(bme, faces=balcony_faces,
+                                                thickness=0.4, depth=-0.6)
+
+                # Final cleanup
+                _bm.ops.recalc_face_normals(bme, faces=bme.faces[:])
+                zero2 = [f for f in bme.faces if f.calc_area() < 1e-8]
+                if zero2:
+                    _bm.ops.delete(bme, geom=zero2, context='FACES')
+                bme.to_mesh(mesh)
+                bme.free()
+                mesh.update()
+
+                # Re-unwrap UV
+                bpy.context.view_layer.objects.active = obj
+                obj.select_set(True)
+                try:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception:
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+                obj.select_set(False)
+
+                processed += 1
+
+            except Exception as exc:
+                skipped.append({"object": obj.name if obj else "?", "error": str(exc)})
+
+        return {
+            "processed": processed,
+            "skipped_count": len(skipped),
+            "skipped": skipped[:10],
+        }
+
+    # ── set_render_settings ───────────────────────────────────────────────────
+
+    def set_render_settings(self):
+        """Configure Cycles render settings and sky/sun lighting."""
+        import math
+
+        scene = bpy.context.scene
+        render = scene.render
+        cycles = scene.cycles
+
+        # Engine + samples
+        render.engine = 'CYCLES'
+        cycles.samples = 256
+        cycles.use_denoising = True
+        render.resolution_x = 1920
+        render.resolution_y = 1080
+        scene.view_settings.view_transform = 'Filmic'
+        scene.view_settings.look = 'High Contrast'
+        scene.view_settings.exposure = 0.5
+
+        # World sky texture
+        world = bpy.data.worlds.get("World") or bpy.data.worlds.new("World")
+        scene.world = world
+        world.use_nodes = True
+        nt = world.node_tree
+        nt.nodes.clear()
+
+        out = nt.nodes.new("ShaderNodeOutputWorld")
+        out.location = (400, 0)
+        bg = nt.nodes.new("ShaderNodeBackground")
+        bg.location = (200, 0)
+        sky = nt.nodes.new("ShaderNodeTexSky")
+        sky.location = (0, 0)
+        sky.sky_type = 'HOSEK_WILKIE'
+        sky.sun_elevation = math.radians(25)
+
+        # Sun rotation follows geo_origin longitude
+        origin_lon = scene.get("geo_origin_lon", 0.0)
+        sky.sun_rotation = math.radians(origin_lon % 360)
+
+        nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
+        nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+
+        # Sun lamp
+        sun_name = "CitySceneSun"
+        if sun_name in bpy.data.objects:
+            bpy.data.objects.remove(bpy.data.objects[sun_name], do_unlink=True)
+        sun_data = bpy.data.lights.new(name=sun_name, type='SUN')
+        sun_data.energy = 5.0
+        sun_data.angle = math.radians(0.5)
+        sun_obj = bpy.data.objects.new(sun_name, sun_data)
+        scene.collection.objects.link(sun_obj)
+        sun_obj.rotation_euler = (
+            math.radians(65),
+            0.0,
+            math.radians(origin_lon % 360),
+        )
+
+        return {
+            "engine": "CYCLES",
+            "samples": 256,
+            "denoising": True,
+            "sky_type": "NISHITA",
+            "sun_elevation_deg": 25,
+            "sun_rotation_deg": round(origin_lon % 360, 2),
+            "exposure": 0.5,
+            "color_management": "Filmic / High Contrast",
+        }
+
+    # ── render_viewport ───────────────────────────────────────────────────────
+
+    def render_viewport(self, output_path, camera_preset="isometric"):
+        """Render the scene to a PNG file using a preset camera."""
+        import math
+        import os
+        import time as _time
+
+        scene = bpy.context.scene
+
+        # Compute scene bounding box
+        all_objs = [o for o in scene.objects if o.type == 'MESH']
+        if not all_objs:
+            return {"error": "No mesh objects in scene"}
+
+        xs, ys, zs = [], [], []
+        for o in all_objs:
+            for v in o.data.vertices:
+                wco = o.matrix_world @ v.co
+                xs.append(wco.x); ys.append(wco.y); zs.append(wco.z)
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        max_z = max(zs)
+        cx = (min_x + max_x) / 2
+        cy = (min_y + max_y) / 2
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+
+        # Remove any previous render camera
+        cam_name = "RenderCam"
+        if cam_name in bpy.data.objects:
+            bpy.data.objects.remove(bpy.data.objects[cam_name], do_unlink=True)
+        if cam_name in bpy.data.cameras:
+            bpy.data.cameras.remove(bpy.data.cameras[cam_name])
+
+        cam_data = bpy.data.cameras.new(cam_name)
+        cam_obj = bpy.data.objects.new(cam_name, cam_data)
+        scene.collection.objects.link(cam_obj)
+
+        if camera_preset == "street_level":
+            cam_data.type = 'PERSP'
+            cam_data.lens = 50.0
+            # Find a road axis: use first road object with ≥2 verts
+            roads_col = bpy.data.collections.get("roads")
+            road_dir = mathutils.Vector((1, 0, 0))
+            if roads_col and roads_col.objects:
+                road_obj = roads_col.objects[0]
+                if road_obj.data.vertices and len(road_obj.data.vertices) >= 2:
+                    v0 = road_obj.matrix_world @ road_obj.data.vertices[0].co
+                    v1 = road_obj.matrix_world @ road_obj.data.vertices[1].co
+                    d = v1 - v0
+                    if d.length > 0.01:
+                        road_dir = d.normalized()
+            cam_obj.location = mathutils.Vector((cx, cy, 1.8))
+            cam_obj.rotation_euler = (
+                math.radians(90), 0, math.atan2(road_dir.x, road_dir.y)
+            )
+
+        elif camera_preset == "aerial":
+            cam_data.type = 'ORTHO'
+            cam_data.ortho_scale = max(span_x, span_y) * 1.1
+            alt = max(max_z + 500, 500)
+            cam_obj.location = mathutils.Vector((cx, cy, alt))
+            cam_obj.rotation_euler = (0, 0, 0)
+
+        else:  # isometric (default)
+            cam_data.type = 'PERSP'
+            cam_data.lens = 85.0
+            diag = math.sqrt(span_x ** 2 + span_y ** 2)
+            # Place camera at a reliable angle that always frames all buildings
+            cam_obj.location = mathutils.Vector((
+                cx + diag * 0.6,
+                cy - diag * 0.6,
+                diag * 0.7,
+            ))
+
+        # Track-to constraint pointing at scene centre for all presets
+        # (street_level uses explicit euler instead)
+        if camera_preset != "street_level":
+            tgt_name = "SceneCentreTarget"
+            if tgt_name in bpy.data.objects:
+                bpy.data.objects.remove(bpy.data.objects[tgt_name], do_unlink=True)
+            tgt = bpy.data.objects.new(tgt_name, None)
+            # Point at a slightly elevated centre so buildings fill lower half of frame
+            tgt.location = mathutils.Vector((cx, cy, max_z * 0.3))
+            scene.collection.objects.link(tgt)
+            tc = cam_obj.constraints.new('TRACK_TO')
+            tc.track_axis = 'TRACK_NEGATIVE_Z'
+            tc.up_axis    = 'UP_Y'
+            tc.target     = tgt
+            bpy.context.view_layer.update()
+
+        # Ground plane (grey, 2× bbox size) — create/replace
+        gname = "GroundPlane"
+        if gname in bpy.data.objects:
+            bpy.data.objects.remove(bpy.data.objects[gname], do_unlink=True)
+        if gname in bpy.data.meshes:
+            bpy.data.meshes.remove(bpy.data.meshes[gname])
+        hx = span_x; hy = span_y
+        gm = bpy.data.meshes.new(gname)
+        gm.from_pydata([
+            (cx - hx, cy - hy, -0.05), (cx + hx, cy - hy, -0.05),
+            (cx + hx, cy + hy, -0.05), (cx - hx, cy + hy, -0.05),
+        ], [], [[0, 1, 2, 3]])
+        gm.update()
+        go = bpy.data.objects.new(gname, gm)
+        scene.collection.objects.link(go)
+        gmat = bpy.data.materials.get("mat_ground") or bpy.data.materials.new("mat_ground")
+        gmat.use_nodes = True
+        gmat.node_tree.nodes.clear()
+        gout  = gmat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        gbsdf = gmat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        gbsdf.inputs["Base Color"].default_value = (0.35, 0.35, 0.33, 1.0)
+        gbsdf.inputs["Roughness"].default_value  = 0.95
+        gmat.node_tree.links.new(gbsdf.outputs["BSDF"], gout.inputs["Surface"])
+        gm.materials.append(gmat)
+
+        scene.camera = cam_obj
+
+        # Output settings
+        render = scene.render
+        render.filepath = output_path
+        render.image_settings.file_format = 'PNG'
+        render.image_settings.color_mode = 'RGBA'
+
+        t0 = _time.time()
+        bpy.ops.render.render(write_still=True)
+        render_time = round(_time.time() - t0, 2)
+
+        file_size_mb = 0.0
+        if os.path.exists(output_path):
+            file_size_mb = round(os.path.getsize(output_path) / 1_048_576, 3)
+
+        return {
+            "output_path": output_path,
+            "camera_preset": camera_preset,
+            "render_time_s": render_time,
+            "file_size_mb": file_size_mb,
+        }
+
     #endregion
 
 # Blender Addon Preferences
